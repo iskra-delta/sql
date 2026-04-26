@@ -379,6 +379,105 @@ static int execute_show_databases(const char *root)
 }
 
 /*
+ * Resolves one database name from the system catalog into its path.
+ */
+static int find_database_path(const char *root, const char *name,
+    char *db_path)
+{
+    dbf_file file;
+    char catalog_path[path_buffer_size];
+    char record[catalog_record_length];
+    char existing_name[catalog_name_length + 1];
+    int state;
+    unsigned long index;
+
+    if (ensure_catalog(root, catalog_path) != 0) {
+        return -1;
+    }
+
+    if (dbf_open(&file, catalog_path) != 0) {
+        return -1;
+    }
+
+    for (index = 0; index < file.record_count; index++) {
+        state = dbf_read(&file, index, record);
+        if (state < 0) {
+            dbf_close(&file);
+            return -1;
+        }
+
+        if (state == 1) {
+            continue;
+        }
+
+        get_field(existing_name, sizeof(existing_name), record,
+            catalog_name_length);
+        if (strcmp(existing_name, name) == 0) {
+            get_field(db_path, path_buffer_size,
+                record + catalog_name_length, catalog_path_length);
+            return dbf_close(&file);
+        }
+    }
+
+    dbf_close(&file);
+    return -1;
+}
+
+/*
+ * Creates one DBF file for a CREATE TABLE statement.
+ */
+static int execute_create_table(const char *root, const char *database_name,
+    const sql_statement *statement)
+{
+    dbf_file file;
+    dbf_field fields[sql_max_columns];
+    char db_path[path_buffer_size];
+    char table_name[path_buffer_size];
+    unsigned short index;
+
+    if (database_name == (const char *)0) {
+        return -1;
+    }
+
+    if (find_database_path(root, database_name, db_path) != 0) {
+        return -1;
+    }
+
+    if (join_path(table_name, db_path, statement->name) != 0) {
+        return -1;
+    }
+
+    if (strlen(table_name) + 5 > path_buffer_size) {
+        return -1;
+    }
+    strcat(table_name, ".dbf");
+
+    if (dbf_open(&file, table_name) == 0) {
+        dbf_close(&file);
+        return -1;
+    }
+
+    for (index = 0; index < statement->column_count; index++) {
+        strcpy(fields[index].name, statement->columns[index].name);
+        fields[index].type = statement->columns[index].dbf_type;
+        fields[index].length = statement->columns[index].length;
+        fields[index].decimals = statement->columns[index].decimals;
+    }
+
+    if (dbf_create(&file, table_name, fields,
+        statement->column_count) != 0) {
+        return -1;
+    }
+
+    if (dbf_close(&file) != 0) {
+        return -1;
+    }
+
+    printf("created table %s in %s\n", statement->name, db_path);
+    return 0;
+}
+
+/*
  * Builds one SQL string from the remaining command-line arguments.
  */
 static int build_sql(char *sql_text, int argc, char *argv[], int start)
@@ -404,11 +503,13 @@ static int build_sql(char *sql_text, int argc, char *argv[], int start)
 /*
  * Parses the minimal command line and returns the SQL start index.
  */
-static int parse_options(int argc, char *argv[], const char **root_out)
+static int parse_options(int argc, char *argv[], const char **root_out,
+    const char **database_out)
 {
     int index;
 
     *root_out = "db";
+    *database_out = (const char *)0;
     index = 1;
     while (index < argc) {
         if (strcmp(argv[index], "--root") == 0) {
@@ -417,6 +518,16 @@ static int parse_options(int argc, char *argv[], const char **root_out)
                 return -1;
             }
             *root_out = argv[index];
+            index++;
+            continue;
+        }
+
+        if (strcmp(argv[index], "--database") == 0) {
+            index++;
+            if (index >= argc) {
+                return -1;
+            }
+            *database_out = argv[index];
             index++;
             continue;
         }
@@ -430,6 +541,7 @@ static int parse_options(int argc, char *argv[], const char **root_out)
 static int run_program(int argc, char *argv[])
 {
     const char *root;
+    const char *database_name;
     const char *program_name;
     sql_statement statement;
     char sql_text[sql_buffer_size];
@@ -440,9 +552,10 @@ static int run_program(int argc, char *argv[])
         program_name = argv[0];
     }
 
-    sql_index = parse_options(argc, argv, &root);
+    sql_index = parse_options(argc, argv, &root, &database_name);
     if (sql_index < 0 || sql_index >= argc) {
-        printf("usage: %s [--root path] \"SQL;\"\n", program_name);
+        printf("usage: %s [--root path] [--database name] \"SQL;\"\n",
+            program_name);
         return 1;
     }
 
@@ -461,6 +574,30 @@ static int run_program(int argc, char *argv[])
 
     if (statement.type == sql_statement_show_databases) {
         return execute_show_databases(root);
+    }
+
+    if (statement.type == sql_statement_create_table) {
+        return execute_create_table(root, database_name, &statement);
+    }
+
+    if (statement.type == sql_statement_select) {
+        printf("select execution is not implemented yet\n");
+        return 1;
+    }
+
+    if (statement.type == sql_statement_insert) {
+        printf("insert execution is not implemented yet\n");
+        return 1;
+    }
+
+    if (statement.type == sql_statement_update) {
+        printf("update execution is not implemented yet\n");
+        return 1;
+    }
+
+    if (statement.type == sql_statement_delete) {
+        printf("delete execution is not implemented yet\n");
+        return 1;
     }
 
     return 1;
