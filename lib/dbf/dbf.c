@@ -125,6 +125,32 @@ static unsigned long load_u32(const unsigned char *buffer)
 }
 
 /*
+ * Loads one DBF field descriptor into the public field structure.
+ */
+static void load_field_descriptor(dbf_field *field,
+    const unsigned char *descriptor)
+{
+    unsigned short index;
+
+    for (index = 0; index < 11; index++) {
+        field->name[index] = (char)descriptor[index];
+        if (descriptor[index] == '\0') {
+            break;
+        }
+    }
+
+    while (index < 11) {
+        field->name[index] = '\0';
+        index++;
+    }
+
+    field->name[11] = '\0';
+    field->type = (char)descriptor[11];
+    field->length = descriptor[16];
+    field->decimals = descriptor[17];
+}
+
+/*
  * Checks whether the basic DBF header values are safe to use.
  */
 static int header_is_valid(unsigned long file_size,
@@ -343,6 +369,30 @@ int dbf_close(dbf_file *file)
     dbf_reset(file);
     if (result != 0) {
         return -1;
+    }
+
+    return 0;
+}
+
+int dbf_read_fields(dbf_file *file, dbf_field *fields,
+    unsigned short field_count)
+{
+    unsigned char descriptor[dbf_field_size];
+    unsigned short index;
+
+    if (file->fd < 0 || field_count < file->field_count) {
+        return -1;
+    }
+
+    if (lseek(file->fd, dbf_header_size, SEEK_SET) < 0) {
+        return -1;
+    }
+
+    for (index = 0; index < file->field_count; index++) {
+        if (read_exact(file->fd, descriptor, dbf_field_size) != 0) {
+            return -1;
+        }
+        load_field_descriptor(&fields[index], descriptor);
     }
 
     return 0;

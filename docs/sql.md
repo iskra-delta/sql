@@ -19,10 +19,10 @@ Near-term behavior:
 - catalog data is stored in `db/sys/db.dbf`
 - `SHOW DATABASES` reads and prints the catalog
 - `CREATE TABLE` maps a small SQL type set onto DBF fields
-- `SELECT` currently parses projections and one simple `WHERE`
-  comparison but is not executed yet
-- `INSERT` currently parses one `VALUES` list but is not executed yet
-- `UPDATE` currently parses one `SET` list and one simple `WHERE`
-  comparison but is not executed yet
-- `DELETE` currently parses one optional simple `WHERE` comparison but
-  is not executed yet
+- `SELECT` scans rows from the current database table and prints
+  projected values with one simple `WHERE` comparison
+- `INSERT` appends one row by position using one `VALUES` list
+- `UPDATE` rewrites matching rows using one `SET` list and one simple
+  `WHERE` comparison
+- `DELETE` marks matching rows deleted using one optional simple
+  `WHERE` comparison

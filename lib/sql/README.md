@@ -1,8 +1,8 @@
 # libsql
 
-`libsql` is the tiny SQL parser used by the main program. It does not
-execute statements. Its job is to parse one SQL string into a fixed C
-structure that later code can inspect.
+`libsql` is the tiny SQL parser used by the main program. It parses one
+SQL string into a fixed C structure that later code can inspect and
+execute.
 
 Public header:
 
@@ -52,8 +52,8 @@ The value is stored as `sql_value`, which contains:
 - `type`
 - `text`
 
-This library currently represents parsed syntax only. It does not
-return result rows.
+This library represents parsed syntax only. Execution happens in the
+main program after parsing succeeds.
 
 ## Supported Statements
 

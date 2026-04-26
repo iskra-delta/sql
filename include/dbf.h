@@ -41,6 +41,14 @@ int dbf_create(dbf_file *file, const char *path,
 int dbf_open(dbf_file *file, const char *path);
 
 /*
+ * Reads the field descriptors from an open DBF file into caller data.
+ * The output array must have room for at least file->field_count items.
+ * Returns zero on success and -1 on failure.
+ */
+int dbf_read_fields(dbf_file *file, dbf_field *fields,
+    unsigned short field_count);
+
+/*
  * Closes an open DBF file descriptor.
  * Returns zero on success and -1 on failure.
  */

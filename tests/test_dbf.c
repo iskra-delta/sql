@@ -169,6 +169,48 @@ static int test_write_delete(void)
 }
 
 /*
+ * Verifies that DBF field descriptors can be read back after create.
+ * Returns zero on success and one on failure.
+ */
+static int test_read_fields(void)
+{
+    dbf_field written[2];
+    dbf_field read_back[2];
+    dbf_file file;
+    const char *path;
+
+    fill_fields(written);
+    path = "../bin/fields.dbf";
+
+    if (dbf_create(&file, path, written, 2) != 0) {
+        return 1;
+    }
+
+    if (dbf_read_fields(&file, read_back, 2) != 0) {
+        dbf_close(&file);
+        return 1;
+    }
+
+    if (dbf_close(&file) != 0) {
+        return 1;
+    }
+
+    if (strcmp(read_back[0].name, "name") != 0
+        || read_back[0].type != 'C'
+        || read_back[0].length != 8) {
+        return 1;
+    }
+
+    if (strcmp(read_back[1].name, "id") != 0
+        || read_back[1].type != 'N'
+        || read_back[1].length != 3) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
  * Opens every DBF fixture and reads sample records when supported.
  * Old dBase II input is expected to be rejected cleanly.
  * Returns zero on success and one on failure.
@@ -248,6 +290,11 @@ int main(void)
 
     if (test_write_delete() != 0) {
         printf("test_dbf: write delete fail\n");
+        return 1;
+    }
+
+    if (test_read_fields() != 0) {
+        printf("test_dbf: read fields fail\n");
         return 1;
     }
 

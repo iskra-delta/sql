@@ -55,7 +55,7 @@ $(libsql_archive): force_libsql
 clean:
 	rm -f $(build_dir)/test_test_dbf.o $(build_dir)/test_test_dbf.d
 	rm -f $(build_dir)/test_test_sql.o $(build_dir)/test_test_sql.d
-	rm -f $(dbf_target) $(sql_target) $(bin_dir)/test.dbf \
-		$(bin_dir)/edit.dbf
+	rm -f $(dbf_target) $(sql_target) $(bin_dir)/demo.dbf $(bin_dir)/test.dbf \
+		$(bin_dir)/edit.dbf $(bin_dir)/fields.dbf
 
 -include $(depends)

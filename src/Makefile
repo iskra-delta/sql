@@ -1,4 +1,4 @@
-project_name := sql_demo
+project_name := sql
 
 cc ?= gcc
 sdcc ?= sdcc
@@ -8,7 +8,7 @@ bin_dir ?= ../bin
 libdbf_dir ?= ../lib/dbf
 libsql_dir ?= ../lib/sql
 
-app_sources := main.c
+app_sources := main.c platform.c
 app_objects := $(patsubst %.c,$(build_dir)/src_%.o,$(app_sources))
 objects := $(app_objects)
 depends := $(objects:.o=.d)
@@ -63,10 +63,13 @@ $(libsql_archive): force_libsql
 sdcc_check: $(app_sources) $(headers) | $(build_dir)
 	$(sdcc) --std-c11 -I$(include_dir) -c main.c \
 		-o $(build_dir)/sdcc_main.rel
+	$(sdcc) --std-c11 -I$(include_dir) -c platform.c \
+		-o $(build_dir)/sdcc_platform.rel
 
 clean:
 	rm -f $(build_dir)/src_main.o $(build_dir)/src_main.d
-	rm -f $(build_dir)/sdcc_main.rel
-	rm -f $(target)
+	rm -f $(build_dir)/src_platform.o $(build_dir)/src_platform.d
+	rm -f $(build_dir)/sdcc_main.rel $(build_dir)/sdcc_platform.rel
+	rm -f $(target) $(bin_dir)/sql_demo
 
 -include $(depends)
