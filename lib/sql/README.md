@@ -274,3 +274,61 @@ if (statement.type == sql_statement_delete) {
 - Extra trailing text causes a parse failure
 - All names are stored in fixed-size buffers
 - The parser is intentionally strict and small
+
+## Grammar
+
+```ebnf
+statement       = create-database
+                | show-databases
+                | create-table
+                | select
+                | insert
+                | update
+                | delete
+                ;
+
+create-database = "CREATE" "DATABASE" name ";" ;
+
+show-databases  = "SHOW" "DATABASES" ";" ;
+
+create-table    = "CREATE" "TABLE" name "(" column-def { "," column-def } ")" ";" ;
+
+column-def      = name column-type { constraint } ;
+
+column-type     = "CHAR" "(" number ")"
+                | "CHARACTER" "(" number ")"
+                | "NUMERIC" "(" number [ "," number ] ")"
+                | "DATE"
+                | "LOGICAL"
+                ;
+
+select          = "SELECT" select-list "FROM" name [ where-clause ] ";" ;
+
+select-list     = "*"
+                | name { "," name }
+                ;
+
+insert          = "INSERT" "INTO" name "VALUES" "(" value { "," value } ")" ";" ;
+
+update          = "UPDATE" name "SET" assignment { "," assignment } [ where-clause ] ";" ;
+
+assignment      = name "=" value ;
+
+delete          = "DELETE" "FROM" name [ where-clause ] ";" ;
+
+where-clause    = "WHERE" name operator value ;
+
+operator        = "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ;
+
+value           = string | number | name ;
+
+string          = "'" { character } "'" ;
+
+number          = digit { digit } ;
+
+name            = letter { letter | digit | "_" } ;
+
+letter          = "A" | ... | "Z" | "a" | ... | "z" | "_" ;
+
+digit           = "0" | ... | "9" ;
+```

@@ -7,78 +7,18 @@
  * Copyright (C) 2026 tomaz stih
  */
 
-#include "sql.h"
-
 #include <ctype.h>
+#include <string.h>
+#include "sql.h"
 
 /*
  * Clears the output statement before parsing begins.
+ * All sentinel values (invalid, none) are defined as zero so a plain
+ * memset is sufficient.
  */
-static void sql_reset(sql_statement *statement)
+static void sql_reset(sql_statement *s)
 {
-    unsigned short index;
-    unsigned short column_index;
-    unsigned short value_index;
-    unsigned short assignment_index;
-
-    statement->type = sql_statement_invalid;
-    for (index = 0; index < sql_name_size; index++) {
-        statement->name[index] = '\0';
-    }
-
-    statement->column_count = 0;
-    for (column_index = 0; column_index < sql_max_columns;
-        column_index++) {
-        statement->columns[column_index].name[0] = '\0';
-        statement->columns[column_index].dbf_type = '\0';
-        statement->columns[column_index].length = 0;
-        statement->columns[column_index].decimals = 0;
-    }
-
-    statement->select_all = 0;
-    statement->select_count = 0;
-    for (column_index = 0; column_index < sql_max_columns;
-        column_index++) {
-        for (index = 0; index < sql_name_size; index++) {
-            statement->select_names[column_index][index] = '\0';
-        }
-    }
-
-    statement->value_count = 0;
-    for (column_index = 0; column_index < sql_max_columns;
-        column_index++) {
-        statement->values[column_index].type = sql_value_none;
-        for (value_index = 0; value_index < sql_value_size;
-            value_index++) {
-            statement->values[column_index].text[value_index] = '\0';
-        }
-    }
-
-    statement->assignment_count = 0;
-    for (assignment_index = 0; assignment_index < sql_max_columns;
-        assignment_index++) {
-        for (index = 0; index < sql_name_size; index++) {
-            statement->assignments[assignment_index]
-                .column_name[index] = '\0';
-        }
-        statement->assignments[assignment_index].value.type
-            = sql_value_none;
-        for (value_index = 0; value_index < sql_value_size;
-            value_index++) {
-            statement->assignments[assignment_index]
-                .value.text[value_index] = '\0';
-        }
-    }
-
-    statement->where.active = 0;
-    for (index = 0; index < sql_name_size; index++) {
-        statement->where.column_name[index] = '\0';
-    }
-    statement->where.operator = sql_compare_invalid;
-    statement->where.value.type = sql_value_none;
-    for (value_index = 0; value_index < sql_value_size; value_index++) {
-        statement->where.value.text[value_index] = '\0';
-    }
+    memset(s, 0, sizeof(*s));
 }
 
 /*
@@ -86,32 +26,24 @@ static void sql_reset(sql_statement *statement)
  */
 static const char *skip_space(const char *text)
 {
-    while (*text != '\0' && isspace((unsigned char)*text)) {
+    while (*text && isspace((unsigned char)*text))
         text++;
-    }
-
     return text;
 }
 
 /*
  * Compares one keyword without caring about ASCII letter case.
+ * Returns zero when the match fails or is not on a word boundary.
  */
 static int keyword_matches(const char *text, const char *keyword)
 {
-    while (*keyword != '\0') {
-        if (toupper((unsigned char)*text)
-            != toupper((unsigned char)*keyword)) {
+    while (*keyword) {
+        if (toupper((unsigned char)*text) != toupper((unsigned char)*keyword))
             return 0;
-        }
         text++;
         keyword++;
     }
-
-    if (isalnum((unsigned char)*text) || *text == '_') {
-        return 0;
-    }
-
-    return 1;
+    return !(isalnum((unsigned char)*text) || *text == '_');
 }
 
 /*
@@ -119,23 +51,16 @@ static int keyword_matches(const char *text, const char *keyword)
  */
 static const char *read_identifier(const char *text, char *name)
 {
-    unsigned short index;
-
-    if (!isalpha((unsigned char)*text) && *text != '_') {
-        return (const char *)0;
-    }
-
-    index = 0;
+    unsigned short i;
+    if (!isalpha((unsigned char)*text) && *text != '_')
+        return NULL;
+    i = 0;
     while (isalnum((unsigned char)*text) || *text == '_') {
-        if (index + 1 >= sql_name_size) {
-            return (const char *)0;
-        }
-        name[index] = *text;
-        index++;
-        text++;
+        if (i + 1 >= sql_name_size)
+            return NULL;
+        name[i++] = *text++;
     }
-
-    name[index] = '\0';
+    name[i] = '\0';
     return text;
 }
 
@@ -144,87 +69,51 @@ static const char *read_identifier(const char *text, char *name)
  */
 static const char *read_number(const char *text, unsigned short *value)
 {
-    unsigned short number;
-
-    if (!isdigit((unsigned char)*text)) {
-        return (const char *)0;
-    }
-
-    number = 0;
-    while (isdigit((unsigned char)*text)) {
-        number = (unsigned short)((number * 10)
-            + (unsigned short)(*text - '0'));
-        text++;
-    }
-
-    *value = number;
+    unsigned short n;
+    if (!isdigit((unsigned char)*text))
+        return NULL;
+    n = 0;
+    while (isdigit((unsigned char)*text))
+        n = (unsigned short)(n * 10 + (*text++ - '0'));
+    *value = n;
     return text;
 }
 
 /*
- * Reads one SQL comparison value into a fixed output buffer.
+ * Parses one SQL value and records its inferred type.
+ * Handles single-quoted strings, digit sequences, and bare identifiers.
  */
-static const char *read_value_text(const char *text, char *value,
-    unsigned short size)
+static const char *parse_value(const char *text, sql_value *val)
 {
-    unsigned short index;
-
-    if (*text == '\'') {
-        text++;
-        index = 0;
-        while (*text != '\0' && *text != '\'') {
-            if (index + 1 >= size) {
-                return (const char *)0;
-            }
-            value[index] = *text;
-            index++;
-            text++;
-        }
-
-        if (*text != '\'') {
-            return (const char *)0;
-        }
-
-        value[index] = '\0';
-        return text + 1;
-    }
-
-    if (isdigit((unsigned char)*text)) {
-        index = 0;
-        while (isdigit((unsigned char)*text)) {
-            if (index + 1 >= size) {
-                return (const char *)0;
-            }
-            value[index] = *text;
-            index++;
-            text++;
-        }
-
-        value[index] = '\0';
-        return text;
-    }
-
-    return read_identifier(text, value);
-}
-
-/*
- * Parses one SQL value and records its inferred fixed output type.
- */
-static const char *parse_value(const char *text, sql_value *value)
-{
+    unsigned short i;
     text = skip_space(text);
     if (*text == '\'') {
-        value->type = sql_value_string;
-        return read_value_text(text, value->text, sql_value_size);
+        val->type = sql_value_string;
+        text++;
+        i = 0;
+        while (*text && *text != '\'') {
+            if (i + 1 >= sql_value_size)
+                return NULL;
+            val->text[i++] = *text++;
+        }
+        if (*text != '\'')
+            return NULL;
+        val->text[i] = '\0';
+        return text + 1;
     }
-
     if (isdigit((unsigned char)*text)) {
-        value->type = sql_value_number;
-        return read_value_text(text, value->text, sql_value_size);
+        val->type = sql_value_number;
+        i = 0;
+        while (isdigit((unsigned char)*text)) {
+            if (i + 1 >= sql_value_size)
+                return NULL;
+            val->text[i++] = *text++;
+        }
+        val->text[i] = '\0';
+        return text;
     }
-
-    value->type = sql_value_identifier;
-    return read_value_text(text, value->text, sql_value_size);
+    val->type = sql_value_identifier;
+    return read_identifier(text, val->text);
 }
 
 /*
@@ -232,134 +121,94 @@ static const char *parse_value(const char *text, sql_value *value)
  */
 static const char *skip_constraints(const char *text)
 {
-    while (*text != '\0' && *text != ',' && *text != ')') {
+    while (*text && *text != ',' && *text != ')')
         text++;
-    }
-
     return text;
 }
 
 /*
  * Parses CHAR(n), CHARACTER(n), NUMERIC(n[,d]), DATE, or LOGICAL.
+ * CHAR and CHARACTER share the same body; klen selects the keyword length.
  */
-static const char *parse_column_type(const char *text, sql_column *column)
+static const char *parse_column_type(const char *text, sql_column *col)
 {
-    unsigned short length;
-    unsigned short decimals;
+    unsigned short len;
+    unsigned short dec;
+    unsigned short klen;
 
     text = skip_space(text);
-    if (keyword_matches(text, "CHAR")) {
-        text += 4;
+    klen = 0;
+    if (keyword_matches(text, "CHARACTER"))
+        klen = 9;
+    else if (keyword_matches(text, "CHAR"))
+        klen = 4;
+    if (klen) {
+        text += klen;
         text = skip_space(text);
-        if (*text != '(') {
-            return (const char *)0;
-        }
-        text++;
+        if (*text++ != '(')
+            return NULL;
         text = skip_space(text);
-        text = read_number(text, &length);
-        if (text == (const char *)0 || length == 0 || length > 255) {
-            return (const char *)0;
-        }
+        if (!(text = read_number(text, &len)) || !len || len > 255)
+            return NULL;
         text = skip_space(text);
-        if (*text != ')') {
-            return (const char *)0;
-        }
-        column->dbf_type = 'C';
-        column->length = (unsigned char)length;
-        column->decimals = 0;
-        return text + 1;
+        if (*text++ != ')')
+            return NULL;
+        col->dbf_type = 'C';
+        col->length = (unsigned char)len;
+        col->decimals = 0;
+        return text;
     }
-
-    if (keyword_matches(text, "CHARACTER")) {
-        text += 9;
-        text = skip_space(text);
-        if (*text != '(') {
-            return (const char *)0;
-        }
-        text++;
-        text = skip_space(text);
-        text = read_number(text, &length);
-        if (text == (const char *)0 || length == 0 || length > 255) {
-            return (const char *)0;
-        }
-        text = skip_space(text);
-        if (*text != ')') {
-            return (const char *)0;
-        }
-        column->dbf_type = 'C';
-        column->length = (unsigned char)length;
-        column->decimals = 0;
-        return text + 1;
-    }
-
     if (keyword_matches(text, "NUMERIC")) {
         text += 7;
         text = skip_space(text);
-        if (*text != '(') {
-            return (const char *)0;
-        }
-        text++;
+        if (*text++ != '(')
+            return NULL;
         text = skip_space(text);
-        text = read_number(text, &length);
-        if (text == (const char *)0 || length == 0 || length > 255) {
-            return (const char *)0;
-        }
-
-        decimals = 0;
+        if (!(text = read_number(text, &len)) || !len || len > 255)
+            return NULL;
+        dec = 0;
         text = skip_space(text);
         if (*text == ',') {
             text++;
             text = skip_space(text);
-            text = read_number(text, &decimals);
-            if (text == (const char *)0 || decimals > length) {
-                return (const char *)0;
-            }
+            if (!(text = read_number(text, &dec)) || dec > len)
+                return NULL;
         }
-
         text = skip_space(text);
-        if (*text != ')') {
-            return (const char *)0;
-        }
-        column->dbf_type = 'N';
-        column->length = (unsigned char)length;
-        column->decimals = (unsigned char)decimals;
-        return text + 1;
+        if (*text++ != ')')
+            return NULL;
+        col->dbf_type = 'N';
+        col->length = (unsigned char)len;
+        col->decimals = (unsigned char)dec;
+        return text;
     }
-
     if (keyword_matches(text, "DATE")) {
-        column->dbf_type = 'D';
-        column->length = 8;
-        column->decimals = 0;
+        col->dbf_type = 'D';
+        col->length = 8;
+        col->decimals = 0;
         return text + 4;
     }
-
     if (keyword_matches(text, "LOGICAL")) {
-        column->dbf_type = 'L';
-        column->length = 1;
-        column->decimals = 0;
+        col->dbf_type = 'L';
+        col->length = 1;
+        col->decimals = 0;
         return text + 7;
     }
-
-    return (const char *)0;
+    return NULL;
 }
 
 /*
  * Parses one CREATE TABLE column definition.
  */
-static const char *parse_column(const char *text, sql_column *column)
+static const char *parse_column(const char *text, sql_column *col)
 {
     text = skip_space(text);
-    text = read_identifier(text, column->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    text = parse_column_type(text, column);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    text = read_identifier(text, col->name);
+    if (!text)
+        return NULL;
+    text = parse_column_type(text, col);
+    if (!text)
+        return NULL;
     text = skip_space(text);
     return skip_constraints(text);
 }
@@ -368,75 +217,39 @@ static const char *parse_column(const char *text, sql_column *column)
  * Parses one SQL comparison operator used by WHERE.
  */
 static const char *parse_compare_operator(const char *text,
-    sql_compare_operator *operator)
+    sql_compare_operator *op)
 {
-    if (text[0] == '<' && text[1] == '>') {
-        *operator = sql_compare_not_equal;
-        return text + 2;
-    }
-
-    if (text[0] == '!' && text[1] == '=') {
-        *operator = sql_compare_not_equal;
-        return text + 2;
-    }
-
-    if (text[0] == '<' && text[1] == '=') {
-        *operator = sql_compare_less_equal;
-        return text + 2;
-    }
-
-    if (text[0] == '>' && text[1] == '=') {
-        *operator = sql_compare_greater_equal;
-        return text + 2;
-    }
-
-    if (text[0] == '=') {
-        *operator = sql_compare_equal;
-        return text + 1;
-    }
-
-    if (text[0] == '<') {
-        *operator = sql_compare_less;
-        return text + 1;
-    }
-
-    if (text[0] == '>') {
-        *operator = sql_compare_greater;
-        return text + 1;
-    }
-
-    return (const char *)0;
+    if (text[0] == '<' && text[1] == '>') { *op = sql_compare_not_equal;     return text + 2; }
+    if (text[0] == '!' && text[1] == '=') { *op = sql_compare_not_equal;     return text + 2; }
+    if (text[0] == '<' && text[1] == '=') { *op = sql_compare_less_equal;    return text + 2; }
+    if (text[0] == '>' && text[1] == '=') { *op = sql_compare_greater_equal; return text + 2; }
+    if (text[0] == '=') { *op = sql_compare_equal;   return text + 1; }
+    if (text[0] == '<') { *op = sql_compare_less;    return text + 1; }
+    if (text[0] == '>') { *op = sql_compare_greater; return text + 1; }
+    return NULL;
 }
 
 /*
  * Parses one WHERE comparison with a single column and value.
+ * Returns the input pointer unchanged when WHERE is absent.
  */
 static const char *parse_where_clause(const char *text, sql_where *where)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "WHERE")) {
+    if (!keyword_matches(text, "WHERE"))
         return text;
-    }
-
     text += 5;
     text = skip_space(text);
     text = read_identifier(text, where->column_name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    if (!text)
+        return NULL;
     text = skip_space(text);
     text = parse_compare_operator(text, &where->operator);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
+    if (!text)
+        return NULL;
     text = parse_value(text, &where->value);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    if (!text)
+        return NULL;
     where->active = 1;
     return text;
 }
@@ -444,430 +257,276 @@ static const char *parse_where_clause(const char *text, sql_where *where)
 /*
  * Parses one comma-separated list of SQL values inside parentheses.
  */
-static const char *parse_value_list(const char *text, sql_statement *statement)
+static const char *parse_value_list(const char *text, sql_statement *stmt)
 {
     const char *next;
-
     text = skip_space(text);
-    if (*text != '(') {
-        return (const char *)0;
-    }
-    text++;
-
+    if (*text++ != '(')
+        return NULL;
     while (1) {
-        if (statement->value_count >= sql_max_columns) {
-            return (const char *)0;
-        }
-
-        next = parse_value(text, &statement->values[statement->value_count]);
-        if (next == (const char *)0) {
-            return (const char *)0;
-        }
-
-        statement->value_count++;
+        if (stmt->value_count >= sql_max_columns)
+            return NULL;
+        next = parse_value(text, &stmt->values[stmt->value_count]);
+        if (!next)
+            return NULL;
+        stmt->value_count++;
         text = skip_space(next);
-        if (*text == ',') {
-            text++;
-            text = skip_space(text);
-            continue;
-        }
-
-        if (*text == ')') {
-            return text + 1;
-        }
-
-        return (const char *)0;
+        if (*text == ',') { text++; continue; }
+        if (*text == ')') return text + 1;
+        return NULL;
     }
 }
 
 /*
  * Parses one update assignment like column = value.
  */
-static const char *parse_assignment(const char *text,
-    sql_assignment *assignment)
+static const char *parse_assignment(const char *text, sql_assignment *asgn)
 {
     text = skip_space(text);
-    text = read_identifier(text, assignment->column_name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    text = read_identifier(text, asgn->column_name);
+    if (!text)
+        return NULL;
     text = skip_space(text);
-    if (*text != '=') {
-        return (const char *)0;
-    }
-    text++;
-
-    text = parse_value(text, &assignment->value);
-    return text;
+    if (*text++ != '=')
+        return NULL;
+    return parse_value(text, &asgn->value);
 }
 
 /*
  * Parses one comma-separated SET assignment list.
  */
-static const char *parse_assignment_list(const char *text,
-    sql_statement *statement)
+static const char *parse_assignment_list(const char *text, sql_statement *stmt)
 {
     const char *next;
-
     while (1) {
-        if (statement->assignment_count >= sql_max_columns) {
-            return (const char *)0;
-        }
-
-        next = parse_assignment(text,
-            &statement->assignments[statement->assignment_count]);
-        if (next == (const char *)0) {
-            return (const char *)0;
-        }
-
-        statement->assignment_count++;
+        if (stmt->assignment_count >= sql_max_columns)
+            return NULL;
+        next = parse_assignment(text, &stmt->assignments[stmt->assignment_count]);
+        if (!next)
+            return NULL;
+        stmt->assignment_count++;
         text = skip_space(next);
-        if (*text != ',') {
+        if (*text != ',')
             return text;
-        }
-
         text++;
-        text = skip_space(text);
     }
 }
 
 /*
  * Parses SELECT * or one comma-separated list of column names.
  */
-static const char *parse_select_list(const char *text,
-    sql_statement *statement)
+static const char *parse_select_list(const char *text, sql_statement *stmt)
 {
     const char *next;
-
     text = skip_space(text);
     if (*text == '*') {
-        statement->select_all = 1;
-        statement->select_count = 0;
+        stmt->select_all = 1;
         return text + 1;
     }
-
     while (1) {
-        if (statement->select_count >= sql_max_columns) {
-            return (const char *)0;
-        }
-
-        next = read_identifier(text,
-            statement->select_names[statement->select_count]);
-        if (next == (const char *)0) {
-            return (const char *)0;
-        }
-
-        statement->select_count++;
+        if (stmt->select_count >= sql_max_columns)
+            return NULL;
+        next = read_identifier(text, stmt->select_names[stmt->select_count]);
+        if (!next)
+            return NULL;
+        stmt->select_count++;
         text = skip_space(next);
-        if (*text != ',') {
+        if (*text != ',')
             return text;
-        }
-
-        text++;
-        text = skip_space(text);
+        text = skip_space(text + 1);
     }
 }
 
 /*
- * Parses CREATE DATABASE name;
+ * Parses CREATE DATABASE name; or CREATE TABLE name (...);
  */
-static const char *parse_create_database(const char *text,
-    sql_statement *statement)
+static const char *parse_create(const char *text, sql_statement *stmt)
 {
+    const char *next;
     text = skip_space(text);
-    if (!keyword_matches(text, "CREATE")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "CREATE"))
+        return NULL;
     text += 6;
     text = skip_space(text);
-    if (!keyword_matches(text, "DATABASE")) {
-        return (const char *)0;
+    if (keyword_matches(text, "DATABASE")) {
+        text += 8;
+        text = skip_space(text);
+        text = read_identifier(text, stmt->name);
+        if (!text)
+            return NULL;
+        stmt->type = sql_statement_create_database;
+        return text;
     }
-
-    text += 8;
-    text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
+    if (keyword_matches(text, "TABLE")) {
+        text += 5;
+        text = skip_space(text);
+        text = read_identifier(text, stmt->name);
+        if (!text)
+            return NULL;
+        text = skip_space(text);
+        if (*text++ != '(')
+            return NULL;
+        while (1) {
+            if (stmt->column_count >= sql_max_columns)
+                return NULL;
+            next = parse_column(text, &stmt->columns[stmt->column_count]);
+            if (!next)
+                return NULL;
+            stmt->column_count++;
+            text = skip_space(next);
+            if (*text == ',') { text++; continue; }
+            if (*text == ')') {
+                stmt->type = sql_statement_create_table;
+                return text + 1;
+            }
+            return NULL;
+        }
     }
-
-    statement->type = sql_statement_create_database;
-    return text;
+    return NULL;
 }
 
 /*
  * Parses SHOW DATABASES;
  */
-static const char *parse_show_databases(const char *text,
-    sql_statement *statement)
+static const char *parse_show_databases(const char *text, sql_statement *stmt)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "SHOW")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "SHOW"))
+        return NULL;
     text += 4;
     text = skip_space(text);
-    if (!keyword_matches(text, "DATABASES")) {
-        return (const char *)0;
-    }
-
-    text += 9;
-    statement->type = sql_statement_show_databases;
-    return text;
-}
-
-/*
- * Parses CREATE TABLE name (column type ...);
- */
-static const char *parse_create_table(const char *text,
-    sql_statement *statement)
-{
-    const char *next;
-
-    text = skip_space(text);
-    if (!keyword_matches(text, "CREATE")) {
-        return (const char *)0;
-    }
-
-    text += 6;
-    text = skip_space(text);
-    if (!keyword_matches(text, "TABLE")) {
-        return (const char *)0;
-    }
-
-    text += 5;
-    text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    if (*text != '(') {
-        return (const char *)0;
-    }
-    text++;
-
-    while (1) {
-        if (statement->column_count >= sql_max_columns) {
-            return (const char *)0;
-        }
-
-        next = parse_column(text,
-            &statement->columns[statement->column_count]);
-        if (next == (const char *)0) {
-            return (const char *)0;
-        }
-        statement->column_count++;
-        text = skip_space(next);
-
-        if (*text == ',') {
-            text++;
-            continue;
-        }
-
-        if (*text == ')') {
-            statement->type = sql_statement_create_table;
-            return text + 1;
-        }
-
-        return (const char *)0;
-    }
+    if (!keyword_matches(text, "DATABASES"))
+        return NULL;
+    stmt->type = sql_statement_show_databases;
+    return text + 9;
 }
 
 /*
  * Parses SELECT columns FROM table [WHERE column op value];
  */
-static const char *parse_select(const char *text, sql_statement *statement)
+static const char *parse_select(const char *text, sql_statement *stmt)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "SELECT")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "SELECT"))
+        return NULL;
     text += 6;
+    text = parse_select_list(text, stmt);
+    if (!text)
+        return NULL;
     text = skip_space(text);
-    text = parse_select_list(text, statement);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    if (!keyword_matches(text, "FROM")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "FROM"))
+        return NULL;
     text += 4;
     text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    text = parse_where_clause(text, &statement->where);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    statement->type = sql_statement_select;
+    text = read_identifier(text, stmt->name);
+    if (!text)
+        return NULL;
+    text = parse_where_clause(text, &stmt->where);
+    if (!text)
+        return NULL;
+    stmt->type = sql_statement_select;
     return text;
 }
 
 /*
  * Parses INSERT INTO table VALUES (value[, value ...]);
  */
-static const char *parse_insert(const char *text, sql_statement *statement)
+static const char *parse_insert(const char *text, sql_statement *stmt)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "INSERT")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "INSERT"))
+        return NULL;
     text += 6;
     text = skip_space(text);
-    if (!keyword_matches(text, "INTO")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "INTO"))
+        return NULL;
     text += 4;
     text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    text = read_identifier(text, stmt->name);
+    if (!text)
+        return NULL;
     text = skip_space(text);
-    if (!keyword_matches(text, "VALUES")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "VALUES"))
+        return NULL;
     text += 6;
-    text = skip_space(text);
-    text = parse_value_list(text, statement);
-    if (text == (const char *)0 || statement->value_count == 0) {
-        return (const char *)0;
-    }
-
-    statement->type = sql_statement_insert;
+    text = parse_value_list(text, stmt);
+    if (!text || stmt->value_count == 0)
+        return NULL;
+    stmt->type = sql_statement_insert;
     return text;
 }
 
 /*
  * Parses UPDATE table SET column = value[, ...] [WHERE ...];
  */
-static const char *parse_update(const char *text, sql_statement *statement)
+static const char *parse_update(const char *text, sql_statement *stmt)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "UPDATE")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "UPDATE"))
+        return NULL;
     text += 6;
     text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
+    text = read_identifier(text, stmt->name);
+    if (!text)
+        return NULL;
     text = skip_space(text);
-    if (!keyword_matches(text, "SET")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "SET"))
+        return NULL;
     text += 3;
     text = skip_space(text);
-    text = parse_assignment_list(text, statement);
-    if (text == (const char *)0 || statement->assignment_count == 0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    text = parse_where_clause(text, &statement->where);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    statement->type = sql_statement_update;
+    text = parse_assignment_list(text, stmt);
+    if (!text || stmt->assignment_count == 0)
+        return NULL;
+    text = parse_where_clause(text, &stmt->where);
+    if (!text)
+        return NULL;
+    stmt->type = sql_statement_update;
     return text;
 }
 
 /*
  * Parses DELETE FROM table [WHERE column op value];
  */
-static const char *parse_delete(const char *text, sql_statement *statement)
+static const char *parse_delete(const char *text, sql_statement *stmt)
 {
     text = skip_space(text);
-    if (!keyword_matches(text, "DELETE")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "DELETE"))
+        return NULL;
     text += 6;
     text = skip_space(text);
-    if (!keyword_matches(text, "FROM")) {
-        return (const char *)0;
-    }
-
+    if (!keyword_matches(text, "FROM"))
+        return NULL;
     text += 4;
     text = skip_space(text);
-    text = read_identifier(text, statement->name);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    text = skip_space(text);
-    text = parse_where_clause(text, &statement->where);
-    if (text == (const char *)0) {
-        return (const char *)0;
-    }
-
-    statement->type = sql_statement_delete;
+    text = read_identifier(text, stmt->name);
+    if (!text)
+        return NULL;
+    text = parse_where_clause(text, &stmt->where);
+    if (!text)
+        return NULL;
+    stmt->type = sql_statement_delete;
     return text;
 }
 
-int sql_parse(const char *text, sql_statement *statement)
+int sql_parse(const char *text, sql_statement *stmt)
 {
     const char *next;
+    const char *p;
 
-    sql_reset(statement);
+    sql_reset(stmt);
+    p = skip_space(text);
 
-    next = parse_create_database(text, statement);
-    if (next == (const char *)0) {
-        next = parse_show_databases(text, statement);
-    }
-    if (next == (const char *)0) {
-        next = parse_create_table(text, statement);
-    }
-    if (next == (const char *)0) {
-        next = parse_select(text, statement);
-    }
-    if (next == (const char *)0) {
-        next = parse_insert(text, statement);
-    }
-    if (next == (const char *)0) {
-        next = parse_update(text, statement);
-    }
-    if (next == (const char *)0) {
-        next = parse_delete(text, statement);
-    }
+    if      (keyword_matches(p, "CREATE")) next = parse_create(text, stmt);
+    else if (keyword_matches(p, "SHOW"))   next = parse_show_databases(text, stmt);
+    else if (keyword_matches(p, "SELECT")) next = parse_select(text, stmt);
+    else if (keyword_matches(p, "INSERT")) next = parse_insert(text, stmt);
+    else if (keyword_matches(p, "UPDATE")) next = parse_update(text, stmt);
+    else if (keyword_matches(p, "DELETE")) next = parse_delete(text, stmt);
+    else                                   return -1;
 
-    if (next == (const char *)0) {
-        return -1;
-    }
-
+    if (!next) return -1;
     next = skip_space(next);
-    if (*next != ';') {
-        return -1;
-    }
-
-    next++;
-    next = skip_space(next);
-    if (*next != '\0') {
-        return -1;
-    }
-
-    return 0;
+    if (*next != ';') return -1;
+    next = skip_space(next + 1);
+    return *next != '\0' ? -1 : 0;
 }
