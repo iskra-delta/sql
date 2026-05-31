@@ -1,141 +1,189 @@
 # sql
 
-`sql` is the hosted development program for the project. It runs
-an interactive SQL shell backed by the small SQL parser and DBF storage
-layer. The same source code compiles for CP/M with SDCC.
-
-The root README describes the main program only. Library details live in
-[lib/dbf/README.md](lib/dbf/README.md) and [lib/sql/README.md](lib/sql/README.md).
-
-## What The Program Does
-
-The current program can:
-
-- create a database entry in the system catalog
-- list databases from the system catalog
-- create a table inside the currently selected database
-- insert rows into a table
-- select rows from a table with one simple `WHERE` condition
-- update rows with one simple `WHERE` condition
-- delete rows with one simple `WHERE` condition
-
-## Project Layout
-
-- `src/` contains the main program and platform I/O layer
-- `include/` contains public headers
-- `lib/dbf/` contains the DBF storage library
-- `lib/sql/` contains the SQL parser library
-- `tests/` contains automated tests
-- `docs/` contains project notes
-- `build/` contains compiler outputs
-- `bin/` contains built programs and test binaries
+An interactive SQL shell for creating and querying small databases.
+Runs on Linux and on Z80-based CP/M machines such as the Iskra Delta
+Partner. Databases are stored as dBase III `.dbf` files; secondary
+indexes use dBase III `.ndx` files.
 
 ## Build
 
 ```sh
-make
+make          # debug build with ASAN/UBSAN
+make release  # optimised build
+make test     # run all automated tests
 ```
 
-This produces `bin/sql`.
+The hosted GCC build uses `-std=c11 -Wall -Wextra -pedantic
+-g -fsanitize=address,undefined`.
 
-Run the automated tests with:
-
-```sh
-make test
-```
-
-The hosted debug build uses `-std=c11 -Wall -Wextra -pedantic -g
--fsanitize=address,undefined`.
-
-## Running The Shell
+## Running
 
 ```sh
 ./bin/sql <root>
 ```
 
-`<root>` is the path to the directory where all databases are stored.
-The directory is created on first run if it does not already exist.
+`<root>` is the directory where all databases are stored. It is created
+on first run.
 
-Example using `./db` as the storage root:
+Prompt:
+- `> ` — no active database
+- `dbname> ` — after `CREATE DATABASE` or `USE`
 
-```sh
-./bin/sql ./db
+Exit with **Ctrl+C**.
+
+Under SDCC/CP/M the default root is `db`.
+
+## Supported SQL
+
+```text
+CREATE DATABASE name;
+SHOW DATABASES;
+USE name;
+DROP DATABASE name;
+
+CREATE TABLE name (col type [, col type ...]);
+DROP TABLE name;
+
+CREATE [UNIQUE] INDEX name ON table (col [, col ...]);
+
+CREATE VIEW name AS SELECT ...;
+DROP VIEW name;
+SHOW VIEWS;
+
+SELECT * | col... | COUNT(*) FROM table|view|(SELECT...)
+  [JOIN table ON col = col]
+  [WHERE expr];
+INSERT INTO table VALUES (val [, val ...]);
+UPDATE table SET col = val [, ...] [WHERE expr];
+DELETE FROM table [WHERE expr];
 ```
 
-The shell prompt shows `> ` when no database is selected, and
-`dbname> ` after a database has been created or is in use.
+Column types: `CHAR(n)`, `CHARACTER(n)`, `NUMERIC(n[,d])`, `DATE`,
+`LOGICAL`.
 
-Exit the shell with **Ctrl+C**.
+WHERE supports `AND`, `OR`, `IN (...)`, nested parentheses, and the
+comparison operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`.
 
-## Session Example
+Identifiers and keywords are case-insensitive. Every statement ends
+with `;`.
+
+## Built-in System Views
+
+| View | Contents |
+|---|---|
+| `sys_databases` | all registered databases |
+| `sys_tables` | tables in the current database |
+| `sys_fields` | field descriptors for each table |
+| `sys_indexes` | indexes registered for the current database |
+| `sys_views` | user-defined views in the current database |
+
+Example:
+```sql
+SELECT * FROM sys_tables;
+SELECT name, type, length FROM sys_fields WHERE table_name = 'people';
+```
+
+## Architecture
+
+The shell runs a three-phase pipeline for every statement:
 
 ```
-> CREATE DATABASE demo;
-created demo
-demo> CREATE TABLE people (name CHAR(16), age NUMERIC(3), born DATE);
-created people
-demo> INSERT INTO people VALUES ('alice', 18, 19900101);
-inserted 1
-demo> SHOW DATABASES;
- 1 ./db/1 demo
-demo> SELECT * FROM people;
-alice | 18 | 19900101
-1 row
-demo> ^C
+SQL text
+  → sql_run()       parse + view expansion  → sqlexec_program
+  → sqlopt_run()    catalog-driven rewrites  → sqlexec_program
+  → sqlexec_run()   tree execution           → output
 ```
 
-## Shell Editing
+All three phases share one `sql_context` struct which holds the
+storage root, active database name, the execution tree, and the I/O
+callback. On CP/M this struct will sit at a fixed address in the
+resident kernel; each phase binary can be loaded separately and called
+via a single `module_run(sql_context *)` entry point.
 
-| Key       | Effect                     |
-|-----------|----------------------------|
-| Any key   | Echo and add to buffer     |
-| Backspace | Erase last character       |
-| Enter     | Submit and execute         |
-| Ctrl+C    | Exit the shell             |
+Subqueries and views are materialised to a temp table (`_tmp.dbf` in
+the current database directory) before the outer query runs. The temp
+file is removed after the outer query closes.
+
+### Optimizer
+
+`lib/sqlopt` performs one catalog-driven pass:
+
+- reads `sys/ndx.dbf` for registered single-field indexes
+- rewrites `filter(col = val → table_scan)` to `index_scan_eq`
+- rewrites `filter(col op val → table_scan)` to `index_scan_range`
+  for `<`, `<=`, `>`, `>=`
+- leaves the `filter` node in place as a correctness guard
+
+The executor acts on index-scan nodes: equality probes do a B-tree
+lookup, range scans walk the B-tree within the specified bounds.
 
 ## Storage Layout
 
-Under the root path the program creates:
-
-```
+```text
 <root>/
   sys/
-    db.dbf        system catalog of all databases
-  1/              first database (slot number assigned automatically)
-    people.dbf    a table inside that database
-  2/              second database
+    db.dbf      database catalog  (name, path, slot)
+    ndx.dbf     index catalog     (db, name, table, key_fields, unique)
+    vw.dbf      view catalog      (db, name, type, statement)
+  1/             first database slot
+    table.dbf
+    index.ndx
+  2/
   ...
 ```
 
-Slot numbers run from 1 to 15.
+Slots run from `1` to `15`. `sys/db.dbf` maps names to paths.
+`sys/ndx.dbf` is used by mutation statements to rebuild indexes and by
+the optimizer to discover available indexes. `sys/vw.dbf` stores
+user-defined view SQL text; built-in `sys_*` views are hardcoded in
+the executor.
 
-## Platform I/O
+## Project Layout
 
-All terminal access is routed through two functions declared in
-`src/platform.h`:
+| Path | Contents |
+|---|---|
+| `src/` | shell entry point and platform I/O |
+| `include/` | public headers |
+| `lib/dbf/` | DBF storage library |
+| `lib/ndx/` | dBase III B-tree index library |
+| `lib/shared/` | catalog, table, WHERE helpers shared by all phases |
+| `lib/sql/` | SQL parser and execution-tree builder |
+| `lib/sqlopt/` | catalog-driven query optimizer |
+| `lib/sqlexec/` | execution-tree executor |
+| `docs/` | design and reference documentation |
+| `tests/` | automated tests |
+| `build/` | compiler outputs |
+| `bin/` | executables |
 
-```c
-int  read_char(void);
-void write_char(char c);
-```
+## Documentation
 
-The hosted build (`platform.c`) sets the terminal to raw mode so
-characters arrive one at a time without echo.  The CP/M build uses BDOS
-calls 8 (console input without echo) and 2 (console output) directly.
+| File | Contents |
+|---|---|
+| `INTRO.md` | shell usage guide with examples |
+| `docs/SQL.md` | SQL grammar, execution tree, statement semantics |
+| `docs/DBF.md` | DBF wire format and API reference |
+| `docs/NDX.md` | NDX wire format and API reference |
+| `docs/MODULES.md` | module architecture for CP/M overlay loading |
+| `docs/REFACTORING.md` | refactoring record and rationale |
 
-## Dependencies
+## Limits
 
-- GCC for hosted development
-- SDCC for CP/M compatibility checking
-- GDB for the VS Code debug workflow
+| Resource | Limit |
+|---|---|
+| Databases per root | 15 |
+| Columns per table | 16 |
+| Identifier length | 16 characters |
+| Value text length | 32 characters |
+| Plan nodes per statement | 20 |
+| Pooled names per plan | 24 |
+| WHERE nodes per statement | 16 |
+| Maximum record buffer | 4096 bytes |
 
-## Debugging
+## Shell Keys
 
-Press `F5` in VS Code to build and run the hosted debug binary.
-
-## Notes
-
-- Development and testing happen under GCC first.
-- SDCC is used only after the hosted build is working.
-- The SQL grammar is intentionally very small at this stage; see
-  [lib/sql/README.md](lib/sql/README.md) for the full EBNF.
+| Key | Effect |
+|---|---|
+| Printable character | echo and append |
+| Backspace / DEL | erase last character |
+| Enter | execute current line |
+| Ctrl+C | exit |

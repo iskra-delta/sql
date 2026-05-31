@@ -12,6 +12,43 @@
 #include <stdio.h>
 #include <string.h>
 
+#define sql_parse sql_parse_statement
+
+static const sql_where_node *where_root_node(const sql_statement *statement)
+{
+    if (!statement->where.active
+        || statement->where.root == (unsigned char)sql_where_nil
+        || statement->where.root >= statement->where.node_count) {
+        return NULL;
+    }
+
+    return &statement->where_nodes[statement->where.root];
+}
+
+static int check_simple_where(const sql_statement *statement,
+    const char *column_name, sql_compare_operator operator,
+    sql_value_type value_type, const char *value_text)
+{
+    const sql_where_node *node;
+
+    node = where_root_node(statement);
+    if (!node || node->type != sql_where_compare
+        || strcmp(node->column_name, column_name) != 0
+        || node->operator != operator
+        || node->value_count != 1
+        || node->value_first >= statement->where.value_count) {
+        return 1;
+    }
+
+    if (statement->where_values[node->value_first].type != value_type
+        || strcmp(statement->where_values[node->value_first].text,
+            value_text) != 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
 /*
  * Verifies that CREATE DATABASE parses into the expected structure.
  * Returns zero on success and one on failure.
@@ -109,6 +146,43 @@ static int test_create_table_parse(void)
 }
 
 /*
+ * Verifies that CREATE [UNIQUE] INDEX parses cleanly.
+ * Returns zero on success and one on failure.
+ */
+static int test_create_index_parse(void)
+{
+    sql_statement statement;
+
+    if (sql_parse("CREATE UNIQUE INDEX people_name ON people "
+        "(city, name);", &statement) != 0) {
+        return 1;
+    }
+
+    if (statement.type != sql_statement_create_index) {
+        return 1;
+    }
+
+    if (strcmp(statement.name, "people_name") != 0) {
+        return 1;
+    }
+
+    if (strcmp(statement.table_name, "people") != 0) {
+        return 1;
+    }
+
+    if (!statement.create_index_unique || statement.key_count != 2) {
+        return 1;
+    }
+
+    if (strcmp(statement.key_names[0], "city") != 0
+        || strcmp(statement.key_names[1], "name") != 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
  * Verifies that SELECT * parses into the expected structure.
  * Returns zero on success and one on failure.
  */
@@ -164,11 +238,15 @@ static int test_select_where_parse(void)
         return 1;
     }
 
-    if (strcmp(statement.select_names[0], "name") != 0) {
+    if (strcmp(statement.select_items[0].column.name, "name") != 0
+        || statement.select_items[0].alias[0] != '\0'
+        || statement.select_items[0].column.qualifier[0] != '\0') {
         return 1;
     }
 
-    if (strcmp(statement.select_names[1], "age") != 0) {
+    if (strcmp(statement.select_items[1].column.name, "age") != 0
+        || statement.select_items[1].alias[0] != '\0'
+        || statement.select_items[1].column.qualifier[0] != '\0') {
         return 1;
     }
 
@@ -176,19 +254,96 @@ static int test_select_where_parse(void)
         return 1;
     }
 
-    if (strcmp(statement.where.column_name, "age") != 0) {
+    if (check_simple_where(&statement, "age", sql_compare_greater_equal,
+        sql_value_number, "18") != 0) {
         return 1;
     }
 
-    if (statement.where.operator != sql_compare_greater_equal) {
+    return 0;
+}
+
+/*
+ * Verifies that SELECT field aliases and table aliases parse cleanly.
+ * Returns zero on success and one on failure.
+ */
+static int test_select_alias_parse(void)
+{
+    sql_statement statement;
+
+    if (sql_parse("SELECT p.name AS person, p.age years FROM people AS p "
+        "WHERE p.age >= 18;", &statement) != 0) {
         return 1;
     }
 
-    if (statement.where.value.type != sql_value_number) {
+    if (statement.type != sql_statement_select
+        || strcmp(statement.name, "people") != 0
+        || strcmp(statement.from_alias, "p") != 0
+        || statement.select_count != 2) {
         return 1;
     }
 
-    if (strcmp(statement.where.value.text, "18") != 0) {
+    if (strcmp(statement.select_items[0].column.qualifier, "p") != 0
+        || strcmp(statement.select_items[0].column.name, "name") != 0
+        || strcmp(statement.select_items[0].alias, "person") != 0) {
+        return 1;
+    }
+
+    if (strcmp(statement.select_items[1].column.qualifier, "p") != 0
+        || strcmp(statement.select_items[1].column.name, "age") != 0
+        || strcmp(statement.select_items[1].alias, "years") != 0) {
+        return 1;
+    }
+
+    if (check_simple_where(&statement, "age", sql_compare_greater_equal,
+        sql_value_number, "18") != 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Verifies that one simple INNER JOIN parses cleanly.
+ * Returns zero on success and one on failure.
+ */
+static int test_select_join_parse(void)
+{
+    sql_statement statement;
+
+    if (sql_parse("SELECT p.name, c.title FROM people AS p JOIN cities c "
+        "ON p.city = c.code WHERE c.region = 'EU';", &statement) != 0) {
+        return 1;
+    }
+
+    if (statement.type != sql_statement_select
+        || strcmp(statement.name, "people") != 0
+        || strcmp(statement.from_alias, "p") != 0
+        || !statement.join_active
+        || strcmp(statement.join_table_name, "cities") != 0
+        || strcmp(statement.join_alias, "c") != 0) {
+        return 1;
+    }
+
+    if (strcmp(statement.join_left.qualifier, "p") != 0
+        || strcmp(statement.join_left.name, "city") != 0
+        || strcmp(statement.join_right.qualifier, "c") != 0
+        || strcmp(statement.join_right.name, "code") != 0) {
+        return 1;
+    }
+
+    if (statement.select_count != 2
+        || strcmp(statement.select_items[0].column.qualifier, "p") != 0
+        || strcmp(statement.select_items[0].column.name, "name") != 0
+        || strcmp(statement.select_items[1].column.qualifier, "c") != 0
+        || strcmp(statement.select_items[1].column.name, "title") != 0) {
+        return 1;
+    }
+
+    if (check_simple_where(&statement, "region", sql_compare_equal,
+        sql_value_string, "EU") != 0) {
+        return 1;
+    }
+    if (strcmp(where_root_node(&statement)->qualifier, "c") != 0) {
         return 1;
     }
 
@@ -208,19 +363,71 @@ static int test_select_string_where_parse(void)
         return 1;
     }
 
-    if (!statement.where.active) {
+    if (check_simple_where(&statement, "city", sql_compare_equal,
+        sql_value_string, "London") != 0) {
         return 1;
     }
 
-    if (statement.where.operator != sql_compare_equal) {
+    return 0;
+}
+
+/*
+ * Verifies that AND, OR, and IN parse into the expected predicate tree.
+ * Returns zero on success and one on failure.
+ */
+static int test_select_logic_parse(void)
+{
+    sql_statement statement;
+    const sql_where_node *root;
+    const sql_where_node *left;
+    const sql_where_node *right;
+    const sql_where_node *right_left;
+    const sql_where_node *right_right;
+
+    if (sql_parse("SELECT name FROM people WHERE city = 'LON' OR age IN "
+        "(18, 21) AND name = 'amy';", &statement) != 0) {
         return 1;
     }
 
-    if (statement.where.value.type != sql_value_string) {
+    if (!statement.where.active || statement.where.node_count != 5
+        || statement.where.value_count != 4) {
         return 1;
     }
 
-    if (strcmp(statement.where.value.text, "London") != 0) {
+    root = where_root_node(&statement);
+    if (!root || root->type != sql_where_or) {
+        return 1;
+    }
+
+    left = &statement.where_nodes[root->left];
+    right = &statement.where_nodes[root->right];
+    if (left->type != sql_where_compare || right->type != sql_where_and) {
+        return 1;
+    }
+
+    if (strcmp(left->column_name, "city") != 0
+        || left->operator != sql_compare_equal
+        || strcmp(statement.where_values[left->value_first].text, "LON")
+            != 0) {
+        return 1;
+    }
+
+    right_left = &statement.where_nodes[right->left];
+    right_right = &statement.where_nodes[right->right];
+    if (right_left->type != sql_where_in
+        || strcmp(right_left->column_name, "age") != 0
+        || right_left->value_count != 2
+        || strcmp(statement.where_values[right_left->value_first].text, "18")
+            != 0
+        || strcmp(statement.where_values[right_left->value_first + 1].text,
+            "21") != 0) {
+        return 1;
+    }
+    if (right_right->type != sql_where_compare
+        || strcmp(right_right->column_name, "name") != 0
+        || right_right->operator != sql_compare_equal
+        || strcmp(statement.where_values[right_right->value_first].text,
+            "amy") != 0) {
         return 1;
     }
 
@@ -313,10 +520,8 @@ static int test_update_parse(void)
         return 1;
     }
 
-    if (!statement.where.active
-        || strcmp(statement.where.column_name, "age") != 0
-        || statement.where.operator != sql_compare_equal
-        || strcmp(statement.where.value.text, "18") != 0) {
+    if (check_simple_where(&statement, "age", sql_compare_equal,
+        sql_value_number, "18") != 0) {
         return 1;
     }
 
@@ -344,20 +549,8 @@ static int test_delete_parse(void)
         return 1;
     }
 
-    if (!statement.where.active) {
-        return 1;
-    }
-
-    if (strcmp(statement.where.column_name, "age") != 0) {
-        return 1;
-    }
-
-    if (statement.where.operator != sql_compare_less) {
-        return 1;
-    }
-
-    if (statement.where.value.type != sql_value_number
-        || strcmp(statement.where.value.text, "18") != 0) {
+    if (check_simple_where(&statement, "age", sql_compare_less,
+        sql_value_number, "18") != 0) {
         return 1;
     }
 
@@ -393,6 +586,19 @@ static int test_invalid_parse(void)
         return 1;
     }
 
+    if (sql_parse("CREATE INDEX idx people (name);", &statement) == 0) {
+        return 1;
+    }
+
+    if (sql_parse("CREATE INDEX idx ON people ();", &statement) == 0) {
+        return 1;
+    }
+
+    if (sql_parse("CREATE INDEX idx ON people (name,);",
+        &statement) == 0) {
+        return 1;
+    }
+
     if (sql_parse("SELECT FROM people;", &statement) == 0) {
         return 1;
     }
@@ -410,6 +616,21 @@ static int test_invalid_parse(void)
     }
 
     if (sql_parse("SELECT name FROM people WHERE age;",
+        &statement) == 0) {
+        return 1;
+    }
+
+    if (sql_parse("SELECT name FROM people WHERE age IN ();",
+        &statement) == 0) {
+        return 1;
+    }
+
+    if (sql_parse("SELECT name FROM people WHERE age = 1 AND;",
+        &statement) == 0) {
+        return 1;
+    }
+
+    if (sql_parse("SELECT name FROM people WHERE OR age = 1;",
         &statement) == 0) {
         return 1;
     }
@@ -466,6 +687,11 @@ int main(void)
         return 1;
     }
 
+    if (test_create_index_parse() != 0) {
+        printf("test_sql: create index parse fail\n");
+        return 1;
+    }
+
     if (test_select_all_parse() != 0) {
         printf("test_sql: select all parse fail\n");
         return 1;
@@ -478,6 +704,21 @@ int main(void)
 
     if (test_select_string_where_parse() != 0) {
         printf("test_sql: select string where parse fail\n");
+        return 1;
+    }
+
+    if (test_select_logic_parse() != 0) {
+        printf("test_sql: select logic parse fail\n");
+        return 1;
+    }
+
+    if (test_select_alias_parse() != 0) {
+        printf("test_sql: select alias parse fail\n");
+        return 1;
+    }
+
+    if (test_select_join_parse() != 0) {
+        printf("test_sql: select join parse fail\n");
         return 1;
     }
 

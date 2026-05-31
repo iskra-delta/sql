@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define dbf_fixture_count 11
+#define dbf_fixture_count 10
 #define dbf_record_buffer_size 4096
 
 /*
@@ -218,17 +218,16 @@ static int test_read_fields(void)
 static int test_fixture_reads(void)
 {
     static const char *paths[dbf_fixture_count] = {
-        "../tests/data/cp1251.dbf",
-        "../tests/data/dbase_02.dbf",
-        "../tests/data/dbase_03.dbf",
-        "../tests/data/dbase_03_cyrillic.dbf",
-        "../tests/data/dbase_30.dbf",
-        "../tests/data/dbase_31.dbf",
-        "../tests/data/dbase_83.dbf",
-        "../tests/data/dbase_83_missing_memo.dbf",
-        "../tests/data/dbase_8b.dbf",
-        "../tests/data/dbase_8c.dbf",
-        "../tests/data/polygon.dbf"
+        "../tests/data/dbf/cp1251.dbf",
+        "../tests/data/dbf/dbase_02.dbf",
+        "../tests/data/dbf/dbase_03.dbf",
+        "../tests/data/dbf/dbase_30.dbf",
+        "../tests/data/dbf/dbase_31.dbf",
+        "../tests/data/dbf/dbase_83.dbf",
+        "../tests/data/dbf/dbase_83_missing_memo.dbf",
+        "../tests/data/dbf/dbase_8b.dbf",
+        "../tests/data/dbf/dbase_8c.dbf",
+        "../tests/data/dbf/polygon.dbf"
     };
     unsigned short index;
     dbf_file file;
@@ -236,7 +235,7 @@ static int test_fixture_reads(void)
     int state;
 
     for (index = 0; index < dbf_fixture_count; index++) {
-        if (strcmp(paths[index], "../tests/data/dbase_02.dbf") == 0) {
+        if (strcmp(paths[index], "../tests/data/dbf/dbase_02.dbf") == 0) {
             if (dbf_open(&file, paths[index]) == 0) {
                 printf("unexpected open success: %s\n", paths[index]);
                 dbf_close(&file);

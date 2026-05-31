@@ -6,14 +6,13 @@ include_dir ?= ../../include
 build_dir ?= ../../build
 shared_dir ?= ../shared
 
-sources := sql.c program.c
-objects := $(patsubst %.c,$(build_dir)/libsql_%.o,$(sources))
+sources := optimize.c
+objects := $(patsubst %.c,$(build_dir)/libsqlopt_%.o,$(sources))
 depends := $(objects:.o=.d)
-headers := $(wildcard $(include_dir)/*.h) $(shared_dir)/shared.h \
-	$(shared_dir)/catalog.h
-archive := $(build_dir)/libsql.a
-sdcc_rel := $(build_dir)/libsql_sql.rel \
-	$(build_dir)/libsql_program.rel
+headers := $(wildcard $(include_dir)/*.h) \
+	$(shared_dir)/shared.h $(shared_dir)/catalog.h
+archive := $(build_dir)/libsqlopt.a
+sdcc_rel := $(build_dir)/libsqlopt_optimize.rel
 
 cflags_common := -std=c11 -I$(include_dir) -I$(shared_dir) \
 	-Wall -Wextra -pedantic
@@ -34,21 +33,19 @@ $(archive): $(objects) | $(build_dir)
 	$(ar) rcs $@ $(objects)
 	$(ranlib) $@
 
-$(build_dir)/libsql_%.o: %.c $(headers) | $(build_dir)
+$(build_dir)/libsqlopt_%.o: %.c $(headers) | $(build_dir)
 	$(cc) $(cflags) -MMD -MP -c $< -o $@
 
 $(build_dir):
 	mkdir -p $(build_dir)
 
 sdcc_check: $(sources) $(headers) | $(build_dir)
-	$(sdcc) --std-c11 -I$(include_dir) -I$(shared_dir) -c sql.c \
-		-o $(build_dir)/libsql_sql.rel
-	$(sdcc) --std-c11 -I$(include_dir) -I$(shared_dir) -c program.c \
-		-o $(build_dir)/libsql_program.rel
+	$(sdcc) --std-c11 -I$(include_dir) -I$(shared_dir) -c optimize.c \
+		-o $(build_dir)/libsqlopt_optimize.rel
 
 clean:
-	rm -f $(build_dir)/libsql_sql.o $(build_dir)/libsql_sql.d
-	rm -f $(build_dir)/libsql_program.o $(build_dir)/libsql_program.d
+	rm -f $(build_dir)/libsqlopt_optimize.o \
+		$(build_dir)/libsqlopt_optimize.d
 	rm -f $(archive) $(sdcc_rel)
 
 test:
