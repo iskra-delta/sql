@@ -27,16 +27,24 @@ typedef struct row_source {
 
 /*
  * Returns 1 when qualifier matches the source by table name or alias.
- * An empty qualifier always matches.
+ * An empty qualifier always matches any source when source count is 1.
  */
 int qualifier_matches_source(const char *qualifier,
     const row_source *source);
 
 /*
- * Resolves a column reference (qualifier.name or just name) against
- * the left and right row sources. Writes the matching source and field
- * index through the output pointers. Returns zero on success and -1
- * when the reference is ambiguous or not found.
+ * Resolves a column reference against an array of N row sources.
+ * For an unqualified name, returns the first source that has the field;
+ * returns -1 if ambiguous (found in more than one source).
+ * For a qualified name, matches by table_name or alias.
+ */
+int resolve_field_ref_n(const row_source *sources, unsigned char count,
+    const char *qualifier, const char *name,
+    const row_source **source_out, int *field_index_out);
+
+/*
+ * Two-source convenience wrapper around resolve_field_ref_n.
+ * Passes right_source only when non-NULL.
  */
 int resolve_field_ref(const row_source *left_source,
     const row_source *right_source, const char *qualifier,
@@ -59,16 +67,28 @@ int field_values_equal(const char *left, char left_type,
 
 /*
  * Returns 1 when every column referenced by where is present in the
- * supplied row sources, 0 otherwise. Used for pre-execution validation.
+ * supplied row sources, 0 otherwise.
+ */
+int where_references_known_fields_n(const sqlexec_program *program,
+    const sql_where *where,
+    const row_source *sources, unsigned char source_count);
+
+/*
+ * Two-source convenience wrapper.
  */
 int where_references_known_fields(const sqlexec_program *program,
     const sql_where *where, const row_source *left_source,
     const row_source *right_source);
 
 /*
- * Evaluates the WHERE tree against the current records in the row
- * sources. Returns 1 when the row matches and 0 when it does not.
+ * Evaluates the WHERE tree against N row sources. Returns 1 on match.
  * An inactive WHERE always returns 1.
+ */
+int where_matches_n(const sqlexec_program *program, const sql_where *where,
+    const row_source *sources, unsigned char source_count);
+
+/*
+ * Two-source convenience wrapper around where_matches_n.
  */
 int where_matches(const sqlexec_program *program, const sql_where *where,
     const row_source *left_source, const row_source *right_source);

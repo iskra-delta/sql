@@ -21,13 +21,17 @@
 
 #include "sqlexec.h"
 
+/* Forward declaration to avoid pulling stdlib.h into every consumer. */
+struct meta_cache;
+
 typedef struct sql_context {
-    const char      *root;                    /* storage root path */
-    char             current_db[sql_name_size]; /* active db; DDL may change */
-    const char      *text;                    /* SQL input, set before parse */
-    sqlexec_program  program;                 /* IR: written by parse, rewritten by opt */
-    sqlexec_io       io;                      /* output callback */
-    int              result;                  /* last phase result: 0=ok, -1=error */
+    const char       *root;                   /* storage root path */
+    char              current_db[sql_name_size]; /* active db; DDL may change */
+    const char       *text;                   /* SQL input, set before parse */
+    sqlexec_program   program;                /* IR: written by parse, rewritten by opt */
+    sqlexec_io        io;                     /* output callback */
+    int               result;                 /* last phase result: 0=ok, -1=error */
+    struct meta_cache *schema;               /* NULL until USE; rebuilt on schema change */
 } sql_context;
 
 /*

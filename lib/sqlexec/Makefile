@@ -7,7 +7,8 @@ build_dir ?= ../../build
 shared_dir ?= ../shared
 
 sources := sqlexec.c execute.c execute_ddl.c execute_select.c \
-	execute_mutate.c execute_scan.c execute_subquery.c
+	execute_mutate.c execute_scan.c execute_subquery.c \
+	execute_sysviews.c
 objects := $(patsubst %.c,$(build_dir)/libsqlexec_%.o,$(sources))
 depends := $(objects:.o=.d)
 headers := $(wildcard $(include_dir)/*.h) \
@@ -77,6 +78,8 @@ clean:
 		$(build_dir)/libsqlexec_execute_scan.d
 	rm -f $(build_dir)/libsqlexec_execute_subquery.o \
 		$(build_dir)/libsqlexec_execute_subquery.d
+	rm -f $(build_dir)/libsqlexec_execute_sysviews.o \
+		$(build_dir)/libsqlexec_execute_sysviews.d
 	rm -f $(archive) $(sdcc_rel)
 
 test:

@@ -21,7 +21,6 @@ typedef struct sqlexec_program sqlexec_program;
 typedef enum sql_statement_type {
     sql_statement_invalid = 0,
     sql_statement_create_database,
-    sql_statement_show_databases,
     sql_statement_use,
     sql_statement_drop_database,
     sql_statement_drop_table,
@@ -29,7 +28,6 @@ typedef enum sql_statement_type {
     sql_statement_create_index,
     sql_statement_create_view,
     sql_statement_drop_view,
-    sql_statement_show_views,
     sql_statement_select,
     sql_statement_insert,
     sql_statement_update,
@@ -52,6 +50,8 @@ typedef struct sql_statement {
     unsigned char join_active;
     char join_table_name[sql_name_size];
     char join_alias[sql_name_size];
+    /* Temporary storage for the ON condition; merged into WHERE after
+     * parse_where_clause runs. Not used by the execution-tree builder. */
     sql_column_ref join_left;
     sql_column_ref join_right;
     unsigned char column_count;

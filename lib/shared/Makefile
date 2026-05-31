@@ -5,10 +5,10 @@ sdcc ?= sdcc
 include_dir ?= ../../include
 build_dir ?= ../../build
 
-sources := shared.c catalog.c where.c
+sources := shared.c catalog.c where.c metacache.c
 objects := $(patsubst %.c,$(build_dir)/libshared_%.o,$(sources))
 depends := $(objects:.o=.d)
-headers := $(wildcard $(include_dir)/*.h) shared.h catalog.h where.h
+headers := $(wildcard $(include_dir)/*.h) shared.h catalog.h where.h metacache.h
 archive := $(build_dir)/libshared.a
 sdcc_rel := $(build_dir)/libshared_shared.rel \
 	$(build_dir)/libshared_catalog.rel \
@@ -53,6 +53,8 @@ clean:
 		$(build_dir)/libshared_catalog.d
 	rm -f $(build_dir)/libshared_where.o \
 		$(build_dir)/libshared_where.d
+	rm -f $(build_dir)/libshared_metacache.o \
+		$(build_dir)/libshared_metacache.d
 	rm -f $(archive) $(sdcc_rel)
 
 test:

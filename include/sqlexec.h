@@ -59,7 +59,6 @@ typedef enum sqlexec_opcode {
     sqlexec_rebuild_table_indexes,
     sqlexec_create_view,
     sqlexec_drop_view,
-    sqlexec_show_views,
     sqlexec_run_subquery,
     sqlexec_delete_temp
 } sqlexec_opcode;
@@ -92,13 +91,22 @@ typedef struct sqlexec_project_def {
     sqlexec_span aliases;
 } sqlexec_project_def;
 
+/* Accessor macros for join name spans in program->names[]. */
+#define join_left_table(p, j)   (p)->names[(j).tables.first + 0]
+#define join_left_alias(p, j)   (p)->names[(j).tables.first + 1]
+#define join_right_table(p, j)  (p)->names[(j).tables.first + 2]
+#define join_right_alias(p, j)  (p)->names[(j).tables.first + 3]
+
+/*
+ * Join definition stored as spans into the program's names[] pool.
+ * tables: names[first]=left_table, names[first+1]=left_alias,
+ *                        names[first+2]=right_table, names[first+3]=right_alias
+ * The ON condition is stored in the WHERE tree as a regular compare
+ * node with the right-hand column encoded as a sql_value_identifier
+ * "qualifier.name" string — no separate keys storage needed.
+ */
 typedef struct sqlexec_join_def {
-    char left_table_name[sql_name_size];
-    char left_alias[sql_name_size];
-    char right_table_name[sql_name_size];
-    char right_alias[sql_name_size];
-    char left_key_name[sql_name_size];
-    char right_key_name[sql_name_size];
+    sqlexec_span tables;   /* 4 names: left_table, left_alias, right_table, right_alias */
 } sqlexec_join_def;
 
 typedef struct sqlexec_index_probe {
@@ -273,6 +281,17 @@ int sqlexec_validate(const sqlexec_program *program);
 int sqlexec_dump(const sqlexec_program *program, char *text,
     unsigned short size);
 #endif
+
+/*
+ * Extracts the source table name and SELECT column information from a
+ * compiled SELECT program. Used by exec_sql_to_temp to determine the
+ * temp table schema without re-walking the tree at every call site.
+ * Returns zero on success and -1 when the program is not a SELECT.
+ */
+int sqlexec_get_output_info(const sqlexec_program *program,
+    const char **table_name_out,
+    unsigned char *select_all_out,
+    sqlexec_span *names_out);
 
 /*
  * Executes one validated execution tree against the DBF/NDX storage

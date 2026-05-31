@@ -11,31 +11,17 @@
 
 #include "exec_impl.h"
 #include "sqlctx.h"
+#include "../shared/metacache.h"
 
 #include <string.h>
-
-static sqlexec_ref child_at(const sqlexec_program *program,
-    sqlexec_ref parent, unsigned char index)
-{
-    sqlexec_ref child;
-
-    child = program->nodes[parent].first_child;
-    while (child != sqlexec_nil && index > 0) {
-        child = program->nodes[child].next_sibling;
-        index--;
-    }
-    return child;
-}
 
 static int is_ddl_root(sqlexec_opcode opcode)
 {
     return opcode == sqlexec_create_database
-        || opcode == sqlexec_show_databases
         || opcode == sqlexec_use_database
         || opcode == sqlexec_create_table
         || opcode == sqlexec_create_view
-        || opcode == sqlexec_drop_view
-        || opcode == sqlexec_show_views;
+        || opcode == sqlexec_drop_view;
 }
 
 static int is_ddl_sequence_first(sqlexec_opcode opcode)
@@ -173,6 +159,7 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
     char *current_db, const sqlexec_io *io)
 {
     sqlexec_env env;
+    int ret;
 
     if (!root || !program || !current_db
         || program->root == sqlexec_nil) {
@@ -180,22 +167,48 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
     }
 
     memset(&env, 0, sizeof(env));
-    env.root = root;
-    env.program = program;
+    env.root       = root;
+    env.program    = program;
     env.current_db = current_db;
-    env.io = io;
+    env.io         = io;
+    env.temp       = NULL;
+    env.schema     = NULL;
 
-    return sqlexec_dispatch(&env);
+    ret = sqlexec_dispatch(&env);
+
+    /* sqlexec_execute has no sql_context to propagate the cache back
+     * through. Free any cache built during this call to avoid leaking. */
+    meta_cache_free(env.schema);
+
+    return ret;
 }
 
 int sqlexec_run(sql_context *ctx)
 {
-    return sqlexec_execute(ctx->root, &ctx->program,
-        ctx->current_db, &ctx->io);
+    sqlexec_env env;
+    int ret;
+
+    if (!ctx || !ctx->root || ctx->program.root == sqlexec_nil) {
+        return -1;
+    }
+
+    memset(&env, 0, sizeof(env));
+    env.root       = ctx->root;
+    env.program    = &ctx->program;
+    env.current_db = ctx->current_db;
+    env.io         = &ctx->io;
+    env.temp       = NULL;
+    env.schema     = ctx->schema;
+
+    ret = sqlexec_dispatch(&env);
+
+    /* Propagate schema changes (USE, CREATE TABLE, DROP TABLE) back. */
+    ctx->schema = env.schema;
+
+    return ret;
 }
 
 int sqlexec_execute_env(sqlexec_env *env)
 {
-    /* Use the provided env directly so write_to_temp is preserved. */
     return sqlexec_dispatch(env);
 }

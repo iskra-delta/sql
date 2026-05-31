@@ -720,9 +720,11 @@ int find_view(const char *root, const char *db_name,
             view_catalog_name_length);
         if (strcmp(record_db, db_name) == 0
             && strcmp(record_name, name) == 0) {
-            type_out[0] = record[view_catalog_db_length
-                + view_catalog_name_length];
-            type_out[1] = '\0';
+            if (type_out) {
+                type_out[0] = record[view_catalog_db_length
+                    + view_catalog_name_length];
+                type_out[1] = '\0';
+            }
             get_field(stmt_out,
                 view_catalog_stmt_length + 1,
                 record + view_catalog_db_length

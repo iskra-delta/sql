@@ -268,3 +268,14 @@ void clear_record(char *record, unsigned short length)
 {
     memset(record, ' ', length);
 }
+
+void copy_subquery(char *dest, const char *src)
+{
+    strncpy(dest, src, sql_subquery_size - 1);
+    dest[sql_subquery_size - 1] = '\0';
+}
+
+unsigned long ndx_to_dbf_index(unsigned long ndx_record)
+{
+    return ndx_record > 0 ? ndx_record - 1 : 0;
+}

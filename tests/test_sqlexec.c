@@ -93,7 +93,7 @@ static int test_tree_helpers(void)
     }
 
     first = sqlexec_append_child(&program, root, sqlexec_create_database);
-    second = sqlexec_append_child(&program, root, sqlexec_show_databases);
+    second = sqlexec_append_child(&program, root, sqlexec_close_table);
     if (first == sqlexec_nil || second == sqlexec_nil) {
         return 1;
     }
@@ -337,18 +337,37 @@ static int test_lower_select_join(void)
         || strcmp(program.names[project->data.project.qualifiers.first + 1],
             "c") != 0
         || !scan || scan->opcode != sqlexec_join_scan
-        || strcmp(scan->data.join.right_table_name, "cities") != 0
-        || strcmp(scan->data.join.left_key_name, "city") != 0
-        || strcmp(scan->data.join.right_key_name, "code") != 0) {
+        || strcmp(join_right_table(&program, scan->data.join), "cities") != 0) {
         return 1;
+    }
+    /* The ON condition is now in the WHERE tree as a compare node with a
+     * sql_value_identifier value encoding the right-hand column "c.code". */
+    {
+        int found_on = 0;
+        unsigned char n;
+        for (n = 0; n < program.where_node_count && !found_on; n++) {
+            const sql_where_node *wn = &program.where_nodes[n];
+            if (wn->type == sql_where_compare
+                && strcmp(wn->qualifier, "p") == 0
+                && strcmp(wn->column_name, "city") == 0
+                && wn->value_count == 1) {
+                const sql_value *wv = &program.where_values[wn->value_first];
+                if (wv->type == sql_value_identifier
+                    && strstr(wv->text, "code") != NULL) {
+                    found_on = 1;
+                }
+            }
+        }
+        if (!found_on) {
+            return 1;
+        }
     }
 
     if (sqlexec_dump(&program, dump, sizeof(dump)) != 0) {
         return 1;
     }
     if (strstr(dump, "project p.name, c.title") == NULL
-        || strstr(dump, "join_scan people as p join cities as c on p.city = c.code")
-            == NULL) {
+        || strstr(dump, "join_scan people as p join cities") == NULL) {
         return 1;
     }
 

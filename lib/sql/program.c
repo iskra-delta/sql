@@ -71,17 +71,24 @@ static int set_join_payload(sqlexec_program *program, sqlexec_ref ref,
     const sql_statement *statement)
 {
     sqlexec_node *node;
+    char table_names[4][sql_name_size];
+    unsigned char table_first;
+
+    copy_name(table_names[0], statement->name);
+    copy_name(table_names[1], statement->from_alias);
+    copy_name(table_names[2], statement->join_table_name);
+    copy_name(table_names[3], statement->join_alias);
+
+    if (sqlexec_add_names(program, table_names, 4, &table_first) != 0) {
+        return -1;
+    }
 
     node = sqlexec_get(program, ref);
     if (!node) {
         return -1;
     }
-    copy_name(node->data.join.left_table_name, statement->name);
-    copy_name(node->data.join.left_alias, statement->from_alias);
-    copy_name(node->data.join.right_table_name, statement->join_table_name);
-    copy_name(node->data.join.right_alias, statement->join_alias);
-    copy_name(node->data.join.left_key_name, statement->join_left.name);
-    copy_name(node->data.join.right_key_name, statement->join_right.name);
+    node->data.join.tables.first = table_first;
+    node->data.join.tables.count = 4;
     return 0;
 }
 
@@ -234,7 +241,7 @@ static int lower_select(sqlexec_program *program,
 
     if (statement->from_is_subquery) {
         /* Materialise the inner query to a temp table first. */
-        strncpy(program->subquery_text, statement->subquery_text, sql_subquery_size - 1); program->subquery_text[sql_subquery_size - 1] = '\0';
+        copy_subquery(program->subquery_text, statement->subquery_text);
         ref = sqlexec_append_child(program, root, sqlexec_run_subquery);
         if (ref == sqlexec_nil || set_named_payload(program, ref, "_tmp") != 0) {
             return -1;
@@ -327,7 +334,7 @@ static int lower_create_view(sqlexec_program *program,
     if (root == sqlexec_nil) {
         return -1;
     }
-    strncpy(program->subquery_text, statement->subquery_text, sql_subquery_size - 1); program->subquery_text[sql_subquery_size - 1] = '\0';
+    copy_subquery(program->subquery_text, statement->subquery_text);
     return set_named_payload(program, root, statement->name);
 }
 
@@ -339,12 +346,6 @@ static int lower_drop_view(sqlexec_program *program,
     root = sqlexec_make_root(program, sqlexec_drop_view);
     return (root == sqlexec_nil
         || set_named_payload(program, root, statement->name) != 0) ? -1 : 0;
-}
-
-static int lower_show_views(sqlexec_program *program)
-{
-    return sqlexec_make_root(program, sqlexec_show_views) == sqlexec_nil
-        ? -1 : 0;
 }
 
 static int lower_insert(sqlexec_program *program,
@@ -557,10 +558,6 @@ static int build_program_from_statement(sqlexec_program *program,
         result = lower_named_root(program, sqlexec_create_database,
             statement->name);
         break;
-    case sql_statement_show_databases:
-        result = sqlexec_make_root(program, sqlexec_show_databases)
-            == sqlexec_nil ? -1 : 0;
-        break;
     case sql_statement_use:
         result = lower_named_root(program, sqlexec_use_database,
             statement->name);
@@ -582,9 +579,6 @@ static int build_program_from_statement(sqlexec_program *program,
         break;
     case sql_statement_drop_view:
         result = lower_drop_view(program, statement);
-        break;
-    case sql_statement_show_views:
-        result = lower_show_views(program);
         break;
     case sql_statement_select:
         result = lower_select(program, statement);
@@ -611,11 +605,108 @@ static int build_program_from_statement(sqlexec_program *program,
     return 0;
 }
 
+/*
+ * Rewrites an UPDATE or DELETE statement to use a view's base table.
+ * The view's WHERE conditions are ANDed with the statement's own WHERE.
+ * Returns zero for simple single-table views and -1 when the view is
+ * too complex (has JOIN, aggregates) or there is no space to merge.
+ */
+static int flatten_view_into_mutation(sql_statement *stmt,
+    const sql_statement *view)
+{
+    unsigned char vi;
+    unsigned char orig_nc;
+    unsigned char orig_vc;
+    unsigned char adjusted_view_root;
+    unsigned char new_root;
+    sql_where_node *n;
+
+    /* A view is updatable when it maps directly to one base table:
+     * no join, no aggregate. The SELECT list is irrelevant for
+     * UPDATE/DELETE — only the base table name and WHERE are used. */
+    if (view->type != sql_statement_select
+        || view->join_active
+        || view->select_count_star) {
+        return -1;
+    }
+
+    copy_name(stmt->name, view->name);
+
+    if (!view->where.active) {
+        return 0;
+    }
+
+    if (!stmt->where.active) {
+        stmt->where = view->where;
+        for (vi = 0; vi < view->where.node_count; vi++) {
+            stmt->where_nodes[vi] = view->where_nodes[vi];
+        }
+        for (vi = 0; vi < view->where.value_count; vi++) {
+            stmt->where_values[vi] = view->where_values[vi];
+        }
+        return 0;
+    }
+
+    orig_nc = stmt->where.node_count;
+    orig_vc = stmt->where.value_count;
+    if ((unsigned short)orig_nc + view->where.node_count + 1 > sql_where_max_nodes
+        || (unsigned short)orig_vc + view->where.value_count > sql_where_max_values) {
+        return -1;
+    }
+
+    for (vi = 0; vi < view->where.node_count; vi++) {
+        n = &stmt->where_nodes[orig_nc + vi];
+        *n = view->where_nodes[vi];
+        if (n->left != (unsigned char)sql_where_nil)
+            n->left = (unsigned char)(n->left + orig_nc);
+        if (n->right != (unsigned char)sql_where_nil)
+            n->right = (unsigned char)(n->right + orig_nc);
+        n->value_first = (unsigned char)(n->value_first + orig_vc);
+    }
+    for (vi = 0; vi < view->where.value_count; vi++) {
+        stmt->where_values[orig_vc + vi] = view->where_values[vi];
+    }
+
+    adjusted_view_root = (unsigned char)(orig_nc + view->where.root);
+    new_root = (unsigned char)(orig_nc + view->where.node_count);
+    n = &stmt->where_nodes[new_root];
+    memset(n, 0, sizeof(*n));
+    n->type = sql_where_and;
+    n->left = stmt->where.root;
+    n->right = adjusted_view_root;
+
+    stmt->where.root = new_root;
+    stmt->where.node_count = (unsigned char)(orig_nc + view->where.node_count + 1);
+    stmt->where.value_count = (unsigned char)(orig_vc + view->where.value_count);
+    return 0;
+}
+
+/*
+ * Validates user view SQL by parsing it immediately and returns the
+ * validated sql_statement through view_inner_out. Returns zero on
+ * success and -1 when the view SQL has a syntax error.
+ */
+static int validate_view_sql(const char *view_stmt,
+    sql_statement *view_inner_out)
+{
+    char buf[sql_subquery_size + 2];
+    size_t vlen;
+
+    vlen = strlen(view_stmt);
+    if (vlen == 0 || vlen + 2 > sizeof(buf)) {
+        return -1;
+    }
+    memcpy(buf, view_stmt, vlen);
+    buf[vlen] = ';';
+    buf[vlen + 1] = '\0';
+    return sql_parse_statement(buf, view_inner_out);
+}
+
 int sql_parse(const char *text, sqlexec_program *program,
     const char *root, const char *current_db)
 {
     sql_statement statement;
-    char view_type[2];
+    sql_statement view_inner;
     char view_stmt[sql_subquery_size];
 
     if (!program || sql_parse_statement(text, &statement) != 0) {
@@ -626,26 +717,41 @@ int sql_parse(const char *text, sqlexec_program *program,
     }
 
     /*
-     * View name resolution: if the FROM table is not a subquery and a
-     * catalog is available, check whether the name is a registered view.
-     * Built-in views (sys_ prefix) are always recognised without catalog.
+     * View expansion. Three cases:
+     *   SELECT sys_*  → built-in view by prefix, no catalog access.
+     *   SELECT name   → user view: validate SQL now, materialise later.
+     *   UPDATE/DELETE → user view: validate SQL now, flatten into base
+     *                   table with merged WHERE conditions.
      */
-    if (statement.type == sql_statement_select
-        && !statement.from_is_subquery
-        && statement.name[0] != '_') {
-        if (statement.name[0] == 's' && statement.name[1] == 'y'
-            && statement.name[2] == 's' && statement.name[3] == '_') {
-            /* Built-in view: pass the view name as subquery text. */
-            strncpy(statement.subquery_text, statement.name, sql_subquery_size - 1); statement.subquery_text[sql_subquery_size - 1] = '\0';
-            strcpy(statement.name, "_tmp");
-            statement.from_is_subquery = 1;
-        } else if (root && current_db && current_db[0]
+    if (!statement.from_is_subquery && statement.name[0] != '_') {
+        if (statement.type == sql_statement_select) {
+            if (statement.name[0] == 's' && statement.name[1] == 'y'
+                && statement.name[2] == 's' && statement.name[3] == '_') {
+                copy_subquery(statement.subquery_text, statement.name);
+                strcpy(statement.name, "_tmp");
+                statement.from_is_subquery = 1;
+            } else if (root && current_db && current_db[0]
+                && find_view(root, current_db, statement.name,
+                    NULL, view_stmt) == 0) {
+                if (validate_view_sql(view_stmt, &view_inner) != 0) {
+                    sqlexec_reset(program);
+                    return -1;
+                }
+                copy_subquery(statement.subquery_text, view_stmt);
+                strcpy(statement.name, "_tmp");
+                statement.from_is_subquery = 1;
+            }
+        } else if ((statement.type == sql_statement_update
+            || statement.type == sql_statement_delete)
+            && root && current_db && current_db[0]
             && find_view(root, current_db, statement.name,
-                view_type, view_stmt) == 0) {
-            /* User-defined view: store its SQL and mark as subquery. */
-            strncpy(statement.subquery_text, view_stmt, sql_subquery_size - 1); statement.subquery_text[sql_subquery_size - 1] = '\0';
-            strcpy(statement.name, "_tmp");
-            statement.from_is_subquery = 1;
+                NULL, view_stmt) == 0) {
+            if (validate_view_sql(view_stmt, &view_inner) != 0
+                || flatten_view_into_mutation(&statement,
+                    &view_inner) != 0) {
+                sqlexec_reset(program);
+                return -1;
+            }
         }
     }
 

@@ -139,4 +139,15 @@ int store_value_in_field(char *target, const dbf_field *field,
  */
 void clear_record(char *record, unsigned short length);
 
+/*
+ * Copies a subquery text string safely into a sql_subquery_size buffer.
+ */
+void copy_subquery(char *dest, const char *src);
+
+/*
+ * Converts a 1-based NDX record number to a 0-based DBF record index.
+ * NDX files store record numbers starting at 1; dbf_read/write use 0-based.
+ */
+unsigned long ndx_to_dbf_index(unsigned long ndx_record);
+
 #endif

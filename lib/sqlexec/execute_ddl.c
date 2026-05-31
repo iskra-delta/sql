@@ -8,14 +8,26 @@
  */
 
 #include "exec_impl.h"
+#include "../shared/metacache.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #if defined(__SDCC)
 extern int unlink(const char *path);
 #else
 #include <unistd.h>
 #endif
+
+/* Rebuild the schema cache for the active database. */
+static void refresh_schema(sqlexec_env *env)
+{
+    if (!env->current_db || !env->current_db[0]) {
+        return;
+    }
+    meta_cache_free(env->schema);
+    env->schema = meta_cache_load(env->root, env->current_db);
+}
 
 /* ------------------------------------------------------------------ */
 /* Output helpers (local to this module)                               */
@@ -39,13 +51,6 @@ static void ddl_write_str(const sqlexec_env *env, const char *s)
     while (*s) {
         ddl_write_char(env, *s++);
     }
-}
-
-static void ddl_write_uint(const sqlexec_env *env, unsigned short n)
-{
-    char buf[6];
-    uint_to_str(n, buf);
-    ddl_write_str(env, buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,54 +118,11 @@ static int execute_create_database(sqlexec_env *env, const char *name)
         return -1;
     }
     strcpy(env->current_db, name);
+    refresh_schema(env);
     ddl_write_str(env, "created ");
     ddl_write_str(env, name);
     ddl_write_nl(env);
     return 0;
-}
-
-static int execute_show_databases(sqlexec_env *env)
-{
-    dbf_file file;
-    char catalog_path[path_buffer_size];
-    char record[catalog_record_length];
-    char name[catalog_name_length + 1];
-    char path[catalog_path_length + 1];
-    unsigned long index;
-    int state;
-    unsigned short slot;
-
-    if (ensure_catalog(env->root, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_open(&file, catalog_path) != 0) {
-        return -1;
-    }
-    for (index = 0; index < file.record_count; index++) {
-        state = dbf_read(&file, index, record);
-        if (state < 0) {
-            dbf_close(&file);
-            return -1;
-        }
-        if (state == 1) {
-            continue;
-        }
-        get_field(name, sizeof(name), record, catalog_name_length);
-        get_field(path, sizeof(path), record + catalog_name_length,
-            catalog_path_length);
-        slot = get_slot_field(record + catalog_name_length
-            + catalog_path_length);
-        if (slot < 10) {
-            ddl_write_char(env, ' ');
-        }
-        ddl_write_uint(env, slot);
-        ddl_write_char(env, ' ');
-        ddl_write_str(env, path);
-        ddl_write_char(env, ' ');
-        ddl_write_str(env, name);
-        ddl_write_nl(env);
-    }
-    return dbf_close(&file);
 }
 
 static int execute_use(sqlexec_env *env, const char *name)
@@ -171,6 +133,7 @@ static int execute_use(sqlexec_env *env, const char *name)
         return -1;
     }
     strcpy(env->current_db, name);
+    refresh_schema(env);
     ddl_write_str(env, "using ");
     ddl_write_str(env, name);
     ddl_write_nl(env);
@@ -254,6 +217,7 @@ static int execute_drop_table(sqlexec_env *env, const char *table_name)
     if (unlink(table_path) != 0) {
         return -1;
     }
+    refresh_schema(env);
     ddl_write_str(env, "dropped ");
     ddl_write_str(env, table_name);
     ddl_write_nl(env);
@@ -307,6 +271,7 @@ static int execute_create_table(sqlexec_env *env,
     if (dbf_close(&file) != 0) {
         return -1;
     }
+    refresh_schema(env);
     ddl_write_str(env, "created ");
     ddl_write_str(env, table_def->name);
     ddl_write_nl(env);
@@ -424,37 +389,6 @@ static int execute_drop_view(sqlexec_env *env, const char *name)
     return 0;
 }
 
-static int execute_show_views(sqlexec_env *env)
-{
-    dbf_file file;
-    char catalog_path[path_buffer_size];
-    char record[view_catalog_record_length];
-    char rec_db[view_catalog_db_length + 1];
-    char rec_name[view_catalog_name_length + 1];
-    unsigned long index;
-    int state;
-
-    if (ensure_view_catalog(env->root, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_open(&file, catalog_path) != 0) {
-        return -1;
-    }
-    for (index = 0; index < file.record_count; index++) {
-        state = dbf_read(&file, index, record);
-        if (state < 0) { dbf_close(&file); return -1; }
-        if (state == 1) continue;
-        get_field(rec_db, sizeof(rec_db), record, view_catalog_db_length);
-        if (env->current_db[0]
-            && strcmp(rec_db, env->current_db) != 0) continue;
-        get_field(rec_name, sizeof(rec_name),
-            record + view_catalog_db_length, view_catalog_name_length);
-        ddl_write_str(env, rec_name);
-        ddl_write_nl(env);
-    }
-    return dbf_close(&file);
-}
-
 /* ------------------------------------------------------------------ */
 /* Module entry point                                                   */
 /* ------------------------------------------------------------------ */
@@ -475,8 +409,6 @@ int exec_ddl(sqlexec_env *env)
     switch (root_node->opcode) {
     case sqlexec_create_database:
         return execute_create_database(env, root_node->data.named.name);
-    case sqlexec_show_databases:
-        return execute_show_databases(env);
     case sqlexec_use_database:
         return execute_use(env, root_node->data.named.name);
     case sqlexec_create_table:
@@ -485,8 +417,6 @@ int exec_ddl(sqlexec_env *env)
         return execute_create_view(env, root_node->data.named.name);
     case sqlexec_drop_view:
         return execute_drop_view(env, root_node->data.named.name);
-    case sqlexec_show_views:
-        return execute_show_views(env);
     case sqlexec_sequence:
         break;
     default:

@@ -12,6 +12,11 @@
 #include "sqlctx.h"
 #include "platform.h"
 
+#include <stddef.h>   /* NULL */
+
+/* metacache.h for meta_cache_free on clean exit. */
+#include "../lib/shared/metacache.h"
+
 #define sql_buffer_size 256
 
 #define CTRL_C  3
@@ -41,6 +46,7 @@ static void shell(const char *root)
     ctx.root = root;
     ctx.current_db[0] = '\0';
     ctx.io.write_char = write_char;
+    ctx.schema = NULL;
 
     while (1) {
         if (ctx.current_db[0]) {
@@ -56,11 +62,13 @@ static void shell(const char *root)
             c = read_char();
             if (c < 0) {
                 write_nl();
+                meta_cache_free(ctx.schema);
                 return;
             }
             if (c == CTRL_C) {
                 write_str("^C");
                 write_nl();
+                meta_cache_free(ctx.schema);
                 return;
             }
             if (c == '\r' || c == '\n') {

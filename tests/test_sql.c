@@ -80,15 +80,20 @@ static int test_show_databases_parse(void)
 {
     sql_statement statement;
 
+    /* SHOW DATABASES expands to SELECT * FROM sys_databases at parse time. */
     if (sql_parse("SHOW DATABASES;", &statement) != 0) {
         return 1;
     }
 
-    if (statement.type != sql_statement_show_databases) {
+    if (statement.type != sql_statement_select) {
         return 1;
     }
 
-    if (statement.name[0] != '\0') {
+    if (!statement.select_all) {
+        return 1;
+    }
+
+    if (strcmp(statement.name, "sys_databases") != 0) {
         return 1;
     }
 
@@ -324,6 +329,7 @@ static int test_select_join_parse(void)
         return 1;
     }
 
+    /* join_left/right are temporary fields holding the ON condition. */
     if (strcmp(statement.join_left.qualifier, "p") != 0
         || strcmp(statement.join_left.name, "city") != 0
         || strcmp(statement.join_right.qualifier, "c") != 0
@@ -339,12 +345,28 @@ static int test_select_join_parse(void)
         return 1;
     }
 
-    if (check_simple_where(&statement, "region", sql_compare_equal,
-        sql_value_string, "EU") != 0) {
+    /* The WHERE tree now contains both the ON condition and the regular WHERE,
+     * joined by an AND root. Verify the WHERE is active and non-trivial. */
+    if (!statement.where.active || statement.where.node_count < 2) {
         return 1;
     }
-    if (strcmp(where_root_node(&statement)->qualifier, "c") != 0) {
-        return 1;
+    /* The region condition must be present somewhere in the tree. */
+    {
+        unsigned char n;
+        int found = 0;
+        for (n = 0; n < statement.where.node_count && !found; n++) {
+            const sql_where_node *wn = &statement.where_nodes[n];
+            if (wn->type == sql_where_compare
+                && strcmp(wn->column_name, "region") == 0
+                && wn->value_count == 1
+                && statement.where_values[wn->value_first].type
+                    == sql_value_string
+                && strcmp(statement.where_values[wn->value_first].text,
+                    "EU") == 0) {
+                found = 1;
+            }
+        }
+        if (!found) return 1;
     }
 
     return 0;

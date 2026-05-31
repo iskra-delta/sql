@@ -247,8 +247,6 @@ static int validate_node(const sqlexec_program *program, sqlexec_ref ref,
     case sqlexec_rebuild_table_indexes:
         return child_count == 0 && name_present(node->data.named.name)
             ? 0 : -1;
-    case sqlexec_show_databases:
-    case sqlexec_show_views:
     case sqlexec_close_table:
     case sqlexec_table_scan:
         return child_count == 0 ? 0 : -1;
@@ -260,10 +258,8 @@ static int validate_node(const sqlexec_program *program, sqlexec_ref ref,
             ? 0 : -1;
     case sqlexec_join_scan:
         return child_count == 0
-            && name_present(node->data.join.left_table_name)
-            && name_present(node->data.join.right_table_name)
-            && name_present(node->data.join.left_key_name)
-            && name_present(node->data.join.right_key_name) ? 0 : -1;
+            && span_valid(program->name_count, node->data.join.tables)
+            && node->data.join.tables.count == 4 ? 0 : -1;
     case sqlexec_count_affected:
     case sqlexec_emit_rows:
     case sqlexec_emit_count:
@@ -533,30 +529,19 @@ static void dump_node_summary(dump_output *out, const sqlexec_program *program,
             dump_text(out, " unique");
         }
         break;
-    case sqlexec_join_scan:
+    case sqlexec_join_scan: {
+        const char *lt = join_left_table(program, node->data.join);
+        const char *la = join_left_alias(program, node->data.join);
+        const char *rt = join_right_table(program, node->data.join);
+        const char *ra = join_right_alias(program, node->data.join);
         dump_char(out, ' ');
-        dump_text(out, node->data.join.left_table_name);
-        if (node->data.join.left_alias[0] != '\0') {
-            dump_text(out, " as ");
-            dump_text(out, node->data.join.left_alias);
-        }
+        dump_text(out, lt);
+        if (la[0] != '\0') { dump_text(out, " as "); dump_text(out, la); }
         dump_text(out, " join ");
-        dump_text(out, node->data.join.right_table_name);
-        if (node->data.join.right_alias[0] != '\0') {
-            dump_text(out, " as ");
-            dump_text(out, node->data.join.right_alias);
-        }
-        dump_text(out, " on ");
-        dump_column_ref(out, node->data.join.left_alias[0] != '\0'
-                ? node->data.join.left_alias
-                : node->data.join.left_table_name,
-            node->data.join.left_key_name);
-        dump_text(out, " = ");
-        dump_column_ref(out, node->data.join.right_alias[0] != '\0'
-                ? node->data.join.right_alias
-                : node->data.join.right_table_name,
-            node->data.join.right_key_name);
+        dump_text(out, rt);
+        if (ra[0] != '\0') { dump_text(out, " as "); dump_text(out, ra); }
         break;
+    }
     case sqlexec_index_scan_eq:
         dump_char(out, ' ');
         dump_text(out, node->data.index_probe.index_name);
@@ -656,7 +641,6 @@ const char *sqlexec_opcode_name(sqlexec_opcode opcode)
     case sqlexec_rebuild_table_indexes: return "rebuild_table_indexes";
     case sqlexec_create_view: return "create_view";
     case sqlexec_drop_view: return "drop_view";
-    case sqlexec_show_views: return "show_views";
     case sqlexec_run_subquery: return "run_subquery";
     case sqlexec_delete_temp: return "delete_temp";
     default: return "invalid";
@@ -866,6 +850,52 @@ int sqlexec_add_assignments(sqlexec_program *program,
     program->assignment_count = (unsigned char)(program->assignment_count
         + count);
     return 0;
+}
+
+int sqlexec_get_output_info(const sqlexec_program *program,
+    const char **table_name_out,
+    unsigned char *select_all_out,
+    sqlexec_span *names_out)
+{
+    sqlexec_ref child;
+    const sqlexec_node *node;
+    const sqlexec_node *root_node;
+
+    if (!program || program->root == sqlexec_nil) {
+        return -1;
+    }
+
+    root_node = &program->nodes[program->root];
+    *table_name_out = NULL;
+    *select_all_out = 1;
+    names_out->first = 0;
+    names_out->count = 0;
+
+    /* Find open_table: root or first child of sequence. */
+    if (root_node->opcode == sqlexec_open_table) {
+        *table_name_out = root_node->data.named.name;
+    } else if (root_node->opcode == sqlexec_sequence) {
+        child = root_node->first_child;
+        while (child != sqlexec_nil) {
+            node = &program->nodes[child];
+            if (node->opcode == sqlexec_open_table) {
+                *table_name_out = node->data.named.name;
+            }
+            /* Find project node inside emit_rows. */
+            if (node->opcode == sqlexec_emit_rows
+                && node->first_child != sqlexec_nil) {
+                const sqlexec_node *pr =
+                    &program->nodes[node->first_child];
+                if (pr->opcode == sqlexec_project) {
+                    *select_all_out = pr->data.project.select_all;
+                    *names_out = pr->data.project.names;
+                }
+            }
+            child = node->next_sibling;
+        }
+    }
+
+    return *table_name_out ? 0 : -1;
 }
 
 #ifdef SQLEXEC_DEBUG

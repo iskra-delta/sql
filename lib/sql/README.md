@@ -25,16 +25,20 @@ statement structure.
 
 ## Public Interface
 
-- `int sql_parse(const char *text, sqlexec_program *program);`
+- `int sql_parse(const char *text, sqlexec_program *program, const char *root, const char *current_db);`
 - `int sql_parse_statement(const char *text, sql_statement *statement);`
 
-`sql_parse()` is the normal public entry point.
+`sql_parse()` is the normal public entry point. It accepts `root` and
+`current_db` for view name resolution; pass `NULL, NULL` when catalog
+access is not needed (e.g. in tests).
 
 It:
 
 - clears and fills one `sqlexec_program`
+- expands `sys_*` table names to built-in view subqueries
+- looks up user view names in `sys/vw.dbf` and validates their SQL
 - returns `0` on success
-- returns `-1` on parse or lowering failure
+- returns `-1` on parse, view validation, or lowering failure
 
 `sql_parse_statement()` remains available as a lower-level helper for:
 

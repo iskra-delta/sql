@@ -50,7 +50,7 @@ CREATE VIEW name AS SELECT ...;
 DROP VIEW name;
 SHOW VIEWS;
 
-SELECT * | col... | COUNT(*) FROM table|view|(SELECT...)
+SELECT * | col... | COUNT(*) | COUNT(n) FROM table|view|(SELECT...)
   [JOIN table ON col = col]
   [WHERE expr];
 INSERT INTO table VALUES (val [, val ...]);
@@ -63,6 +63,10 @@ Column types: `CHAR(n)`, `CHARACTER(n)`, `NUMERIC(n[,d])`, `DATE`,
 
 WHERE supports `AND`, `OR`, `IN (...)`, nested parentheses, and the
 comparison operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`.
+
+The JOIN `ON` condition is merged into the WHERE tree at parse time,
+so a single N-source evaluator handles both join equality and filter
+predicates with no special-case code in the executor.
 
 Identifiers and keywords are case-insensitive. Every statement ends
 with `;`.

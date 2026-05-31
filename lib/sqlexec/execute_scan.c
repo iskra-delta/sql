@@ -141,11 +141,10 @@ static int read_and_act(exec_index_scan_ctx *ctx,
     int state;
     unsigned long dbf_index;
 
-    /* NDX stores 1-based record numbers; DBF API uses 0-based. */
     if (record_number == 0UL) {
         return 0;
     }
-    dbf_index = record_number - 1UL;
+    dbf_index = ndx_to_dbf_index(record_number);
     state = dbf_read(ctx->file, dbf_index, ctx->record);
     if (state < 0) {
         ctx->failed = 1;

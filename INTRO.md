@@ -111,11 +111,13 @@ carol | 30
 2 rows
 ```
 
-Count rows:
+Count rows (`COUNT(1)` is equivalent to `COUNT(*)`):
 
 ```
 demo> SELECT COUNT(*) FROM people WHERE active = T;
 2
+demo> SELECT COUNT(1) FROM people;
+3
 ```
 
 Update matching rows:

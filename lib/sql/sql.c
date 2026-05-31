@@ -35,7 +35,7 @@ static void copy_name(char *target, const char *source)
     target[sql_name_size - 1] = '\0';
 }
 
-static void copy_column_ref(sql_column_ref *target, const char *qualifier,
+static void copy_column_ref_name(sql_column_ref *target, const char *qualifier,
     const char *name)
 {
     copy_name(target->qualifier, qualifier);
@@ -770,6 +770,82 @@ static int normalize_select_items(sql_statement *stmt)
     return 0;
 }
 
+/*
+ * Adds the JOIN ON condition to the statement's WHERE tree as a regular
+ * compare node. The right-hand column is encoded as a sql_value_identifier
+ * with "qualifier.name" dot notation so the N-source WHERE evaluator can
+ * resolve it against whichever source it belongs to at execution time.
+ */
+static const char *add_on_to_where(sql_statement *stmt,
+    const char *left_qualifier, const char *left_name,
+    const char *right_qualifier, const char *right_name)
+{
+    sql_where_node *wn;
+    sql_value *wv;
+    unsigned char on_idx;
+    unsigned char and_idx;
+    unsigned char old_root;
+    unsigned short qlen;
+    unsigned short nlen;
+
+    /* Need room for one compare node + possibly one AND node. */
+    if ((unsigned short)stmt->where.node_count + 2 > sql_where_max_nodes) {
+        return NULL;
+    }
+    if ((unsigned short)stmt->where.value_count + 1 > sql_where_max_values) {
+        return NULL;
+    }
+
+    /* Build compare node: left_qualifier.left_name = identifier(rq.rn) */
+    on_idx = stmt->where.node_count;
+    wn = &stmt->where_nodes[on_idx];
+    memset(wn, 0, sizeof(*wn));
+    wn->type = sql_where_compare;
+    copy_name(wn->qualifier, left_qualifier);
+    copy_name(wn->column_name, left_name);
+    wn->operator = sql_compare_equal;
+    wn->value_first = stmt->where.value_count;
+    wn->value_count = 1;
+    stmt->where.node_count++;
+
+    /* Encode right-hand column as "qualifier.name" identifier. */
+    wv = &stmt->where_values[stmt->where.value_count];
+    wv->type = sql_value_identifier;
+    qlen = (unsigned short)strlen(right_qualifier);
+    nlen = (unsigned short)strlen(right_name);
+    if (right_qualifier[0] != '\0') {
+        if (qlen + 1 + nlen + 1 > sql_value_size) {
+            return NULL;
+        }
+        memcpy(wv->text, right_qualifier, qlen);
+        wv->text[qlen] = '.';
+        memcpy(wv->text + qlen + 1, right_name, nlen);
+        wv->text[qlen + 1 + nlen] = '\0';
+    } else {
+        strncpy(wv->text, right_name, sql_value_size - 1);
+        wv->text[sql_value_size - 1] = '\0';
+    }
+    stmt->where.value_count++;
+
+    /* AND the ON condition with any existing WHERE clause. */
+    if (stmt->where.active) {
+        old_root = stmt->where.root;
+        and_idx = stmt->where.node_count;
+        wn = &stmt->where_nodes[and_idx];
+        memset(wn, 0, sizeof(*wn));
+        wn->type = sql_where_and;
+        wn->left = old_root;
+        wn->right = on_idx;
+        stmt->where.node_count++;
+        stmt->where.root = and_idx;
+    } else {
+        stmt->where.active = 1;
+        stmt->where.root = on_idx;
+    }
+
+    return (const char *)1; /* non-NULL = success */
+}
+
 static const char *parse_join_condition(const char *text, sql_statement *stmt)
 {
     char left_qualifier[sql_name_size];
@@ -801,23 +877,26 @@ static const char *parse_join_condition(const char *text, sql_statement *stmt)
         return NULL;
     }
 
-    left_is_left = qualifier_matches_source(left_qualifier, stmt->name,
-        stmt->from_alias);
+    left_is_left  = qualifier_matches_source(left_qualifier,
+        stmt->name, stmt->from_alias);
     left_is_right = qualifier_matches_source(left_qualifier,
         stmt->join_table_name, stmt->join_alias);
-    right_is_left = qualifier_matches_source(right_qualifier, stmt->name,
-        stmt->from_alias);
+    right_is_left  = qualifier_matches_source(right_qualifier,
+        stmt->name, stmt->from_alias);
     right_is_right = qualifier_matches_source(right_qualifier,
         stmt->join_table_name, stmt->join_alias);
 
+    /* Normalise so left side always belongs to the left table. Store the
+     * ON condition in join_left/right for now; it will be merged into the
+     * WHERE tree after parse_where_clause has run (in parse_select). */
     if (left_is_left && right_is_right) {
-        copy_column_ref(&stmt->join_left, left_qualifier, left_name);
-        copy_column_ref(&stmt->join_right, right_qualifier, right_name);
+        copy_column_ref_name(&stmt->join_left,  left_qualifier,  left_name);
+        copy_column_ref_name(&stmt->join_right, right_qualifier, right_name);
         return text;
     }
     if (left_is_right && right_is_left) {
-        copy_column_ref(&stmt->join_left, right_qualifier, right_name);
-        copy_column_ref(&stmt->join_right, left_qualifier, left_name);
+        copy_column_ref_name(&stmt->join_left,  right_qualifier, right_name);
+        copy_column_ref_name(&stmt->join_right, left_qualifier,  left_name);
         return text;
     }
 
@@ -834,13 +913,15 @@ static const char *parse_select_list(const char *text, sql_statement *stmt)
 
     text = skip_space(text);
     if (keyword_matches(text, "COUNT")) {
+        /* COUNT(*) and COUNT(n) are semantically identical — normalise both. */
         text += 5;
         text = skip_space(text);
         if (*text++ != '(') return NULL;
         text = skip_space(text);
-        if (*text++ != '*') return NULL;
-        text = skip_space(text);
-        if (*text++ != ')') return NULL;
+        while (*text && *text != ')' && *text != ',')
+            text++;
+        if (*text != ')') return NULL;
+        text++;
         stmt->select_count_star = 1;
         return text;
     }
@@ -1019,7 +1100,9 @@ static const char *parse_create(const char *text, sql_statement *stmt)
 }
 
 /*
- * Parses SHOW DATABASES; or SHOW VIEWS;
+ * Parses SHOW DATABASES; or SHOW VIEWS; by expanding them into
+ * SELECT * FROM sys_databases / sys_views at parse time.
+ * This removes dedicated opcodes and lets the view pipeline handle output.
  */
 static const char *parse_show(const char *text, sql_statement *stmt)
 {
@@ -1029,11 +1112,15 @@ static const char *parse_show(const char *text, sql_statement *stmt)
     text += 4;
     text = skip_space(text);
     if (keyword_matches(text, "DATABASES")) {
-        stmt->type = sql_statement_show_databases;
+        stmt->type = sql_statement_select;
+        stmt->select_all = 1;
+        strcpy(stmt->name, "sys_databases");
         return text + 9;
     }
     if (keyword_matches(text, "VIEWS")) {
-        stmt->type = sql_statement_show_views;
+        stmt->type = sql_statement_select;
+        stmt->select_all = 1;
+        strcpy(stmt->name, "sys_views");
         return text + 5;
     }
     return NULL;
@@ -1119,6 +1206,16 @@ static const char *parse_select(const char *text, sql_statement *stmt)
         stmt->join_table_name, stmt->join_alias, 1);
     if (!text)
         return NULL;
+    /* Merge the JOIN ON condition into the WHERE tree now that the
+     * regular WHERE clause has been parsed (parse_where_clause resets
+     * node counts, so we add the ON condition after it). */
+    if (stmt->join_active && stmt->join_left.name[0] != '\0') {
+        if (!add_on_to_where(stmt,
+            stmt->join_left.qualifier,  stmt->join_left.name,
+            stmt->join_right.qualifier, stmt->join_right.name)) {
+            return NULL;
+        }
+    }
     stmt->type = sql_statement_select;
     return text;
 }

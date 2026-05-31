@@ -45,87 +45,6 @@ static void sel_write_uint(const sqlexec_env *env, unsigned short n)
 /* Tree navigation helpers                                              */
 /* ------------------------------------------------------------------ */
 
-static sqlexec_ref child_at(const sqlexec_program *program,
-    sqlexec_ref parent, unsigned char index)
-{
-    sqlexec_ref child;
-
-    child = program->nodes[parent].first_child;
-    while (child != sqlexec_nil && index > 0) {
-        child = program->nodes[child].next_sibling;
-        index--;
-    }
-    return child;
-}
-
-static int resolve_scan_node(const sqlexec_program *program,
-    sqlexec_ref input_ref, sql_where *where, sqlexec_ref *scan_ref_out)
-{
-    const sqlexec_node *node;
-
-    if (!where || !scan_ref_out || input_ref == sqlexec_nil) {
-        return -1;
-    }
-    memset(where, 0, sizeof(*where));
-    node = sqlexec_get_const(program, input_ref);
-    if (!node) {
-        return -1;
-    }
-    if (node->opcode == sqlexec_filter) {
-        *where = node->data.where;
-        input_ref = child_at(program, input_ref, 0);
-        if (input_ref == sqlexec_nil) {
-            return -1;
-        }
-        node = sqlexec_get_const(program, input_ref);
-        if (!node) {
-            return -1;
-        }
-    }
-    if (node->opcode != sqlexec_table_scan
-        && node->opcode != sqlexec_join_scan
-        && node->opcode != sqlexec_index_scan_eq
-        && node->opcode != sqlexec_index_scan_range) {
-        return -1;
-    }
-    *scan_ref_out = input_ref;
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Index scan helpers                                                   */
-/* ------------------------------------------------------------------ */
-
-static int open_ndx(const sqlexec_env *env, const char *index_name,
-    ndx_file *ndx)
-{
-    char index_path[path_buffer_size];
-
-    if (build_index_path(env->root, env->current_db, index_name,
-        index_path) != 0) {
-        return -1;
-    }
-    return ndx_open(ndx, index_path);
-}
-
-static int build_eq_key(ndx_file *ndx, const sql_value *value,
-    unsigned char *key_out)
-{
-    if (ndx->key_type == ndx_key_type_numeric) {
-        return ndx_encode_number_key(key_out, value->text);
-    }
-    return ndx_encode_text_key(key_out, ndx->key_length, value->text);
-}
-
-static int build_bound_key(ndx_file *ndx, const sql_value *value,
-    unsigned char *key_out)
-{
-    if (value->type == sql_value_none || value->text[0] == '\0') {
-        return -1;
-    }
-    return build_eq_key(ndx, value, key_out);
-}
-
 /* ------------------------------------------------------------------ */
 /* Row output                                                           */
 /* ------------------------------------------------------------------ */
@@ -198,8 +117,6 @@ int exec_select(sqlexec_env *env, const char *table_name,
     unsigned short right_offsets[sql_max_columns];
     char record[table_record_size];
     char right_record[table_record_size];
-    char left_join_value[sql_value_size];
-    char right_join_value[sql_value_size];
     sql_where where;
     row_source left_source;
     row_source right_source;
@@ -215,8 +132,6 @@ int exec_select(sqlexec_env *env, const char *table_name,
     int right_state;
     int field_index;
     int right_opened;
-    int left_join_index;
-    int right_join_index;
     ndx_file ndx;
     exec_index_scan_ctx scan_ctx;
     int scan_result;
@@ -280,36 +195,22 @@ int exec_select(sqlexec_env *env, const char *table_name,
     right_source.offsets = NULL;
     right_source.record = right_record;
     right_source.field_count = 0;
-    left_join_index = -1;
-    right_join_index = -1;
-
     if (scan_node->opcode == sqlexec_join_scan) {
-        left_source.table_name =
-            scan_node->data.join.left_table_name;
-        left_source.alias = scan_node->data.join.left_alias;
+        const sqlexec_join_def *j = &scan_node->data.join;
+        left_source.table_name  = join_left_table(env->program, *j);
+        left_source.alias       = join_left_alias(env->program, *j);
         if (open_table_file(env->root, env->current_db,
-            scan_node->data.join.right_table_name, &right_file,
+            join_right_table(env->program, *j), &right_file,
             right_fields, right_offsets) != 0) {
             dbf_close(&file);
             return -1;
         }
         right_opened = 1;
-        right_source.table_name =
-            scan_node->data.join.right_table_name;
-        right_source.alias = scan_node->data.join.right_alias;
-        right_source.fields = right_fields;
-        right_source.offsets = right_offsets;
+        right_source.table_name  = join_right_table(env->program, *j);
+        right_source.alias       = join_right_alias(env->program, *j);
+        right_source.fields      = right_fields;
+        right_source.offsets     = right_offsets;
         right_source.field_count = right_file.field_count;
-        left_join_index = find_field_index(fields, file.field_count,
-            scan_node->data.join.left_key_name);
-        right_join_index = find_field_index(right_fields,
-            right_file.field_count,
-            scan_node->data.join.right_key_name);
-        if (left_join_index < 0 || right_join_index < 0) {
-            dbf_close(&right_file);
-            dbf_close(&file);
-            return -1;
-        }
     }
 
     if (emit_node->opcode == sqlexec_emit_rows) {
@@ -340,13 +241,17 @@ int exec_select(sqlexec_env *env, const char *table_name,
         }
     }
 
-    if (!where_references_known_fields(env->program, &where,
-        &left_source, right_opened ? &right_source : NULL)) {
-        if (right_opened) {
-            dbf_close(&right_file);
+    {
+        row_source chk_sources[2];
+        unsigned char chk_count = 1;
+        chk_sources[0] = left_source;
+        if (right_opened) chk_sources[chk_count++] = right_source;
+        if (!where_references_known_fields_n(env->program, &where,
+            chk_sources, chk_count)) {
+            if (right_opened) dbf_close(&right_file);
+            dbf_close(&file);
+            return -1;
         }
-        dbf_close(&file);
-        return -1;
     }
 
     row_count = 0;
@@ -435,8 +340,8 @@ int exec_select(sqlexec_env *env, const char *table_name,
                     continue;
                 }
                 if (emit_node->opcode != sqlexec_emit_count) {
-                    if (env->write_to_temp) {
-                        append_projected_to_temp(env,
+                    if (env->temp) {
+                        append_projected_to_temp(env->temp, env,
                             &project_node->data.project,
                             &left_source);
                     } else {
@@ -462,23 +367,16 @@ int exec_select(sqlexec_env *env, const char *table_name,
                 if (right_state == 1) {
                     continue;
                 }
-                trim_field_value(left_join_value,
-                    sizeof(left_join_value),
-                    record + offsets[left_join_index],
-                    fields[left_join_index].length);
-                trim_field_value(right_join_value,
-                    sizeof(right_join_value),
-                    right_record + right_offsets[right_join_index],
-                    right_fields[right_join_index].length);
-                if (!field_values_equal(left_join_value,
-                    fields[left_join_index].type,
-                    right_join_value,
-                    right_fields[right_join_index].type)) {
-                    continue;
-                }
-                if (!where_matches(env->program, &where,
-                    &left_source, &right_source)) {
-                    continue;
+                /* The ON condition is in the WHERE tree. Evaluate it
+                 * alongside any regular WHERE clause using N sources. */
+                {
+                    row_source join_sources[2];
+                    join_sources[0] = left_source;
+                    join_sources[1] = right_source;
+                    if (!where_matches_n(env->program, &where,
+                        join_sources, 2)) {
+                        continue;
+                    }
                 }
                 if (emit_node->opcode != sqlexec_emit_count) {
                     write_projected_row(env,

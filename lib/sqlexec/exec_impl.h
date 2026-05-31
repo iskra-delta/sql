@@ -14,23 +14,35 @@
 #include "ndx.h"
 #include "../shared/where.h"
 #include "../shared/catalog.h"
+#include "../shared/metacache.h"
+
+#include <string.h>
 
 /*
  * Execution environment threaded through every executor function.
  * Holds the context that would otherwise require global state.
  */
+/*
+ * Context for materialising an inner query into a temp DBF.
+ * Passed to exec_select only when building a subquery result;
+ * NULL in all normal execution paths.
+ */
+typedef struct exec_temp_ctx {
+    dbf_file       *out;
+    const dbf_field *fields;
+    const unsigned short *offsets;
+    unsigned short  field_count;
+} exec_temp_ctx;
+
 typedef struct sqlexec_env {
     const char *root;
     const sqlexec_program *program;
     char *current_db;
     const sqlexec_io *io;
-    /* When write_to_temp is set, exec_select appends projected rows to
-     * temp_out instead of writing text to io. */
-    int write_to_temp;
-    dbf_file *temp_out;
-    const dbf_field *temp_fields;
-    const unsigned short *temp_offsets;
-    unsigned short temp_field_count;
+    /* Non-NULL only when materialising a subquery to a temp table. */
+    exec_temp_ctx *temp;
+    /* Schema cache: non-NULL after USE, freed on schema change. */
+    meta_cache *schema;
 } sqlexec_env;
 
 /* ------------------------------------------------------------------ */
@@ -102,10 +114,83 @@ int exec_range_scan_callback(unsigned long record_number,
 /* Subquery execution entry points                                      */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Shared inline helpers used by multiple executor files               */
+/* ------------------------------------------------------------------ */
+
+static inline sqlexec_ref child_at(const sqlexec_program *program,
+    sqlexec_ref parent, unsigned char index)
+{
+    sqlexec_ref child;
+    child = program->nodes[parent].first_child;
+    while (child != sqlexec_nil && index > 0) {
+        child = program->nodes[child].next_sibling;
+        index--;
+    }
+    return child;
+}
+
+static inline int resolve_scan_node(const sqlexec_program *program,
+    sqlexec_ref input_ref, sql_where *where, sqlexec_ref *scan_ref_out)
+{
+    const sqlexec_node *node;
+    if (!where || !scan_ref_out || input_ref == sqlexec_nil) return -1;
+    memset(where, 0, sizeof(*where));
+    node = sqlexec_get_const(program, input_ref);
+    if (!node) return -1;
+    if (node->opcode == sqlexec_filter) {
+        *where = node->data.where;
+        input_ref = child_at(program, input_ref, 0);
+        if (input_ref == sqlexec_nil) return -1;
+        node = sqlexec_get_const(program, input_ref);
+        if (!node) return -1;
+    }
+    if (node->opcode != sqlexec_table_scan
+        && node->opcode != sqlexec_join_scan
+        && node->opcode != sqlexec_index_scan_eq
+        && node->opcode != sqlexec_index_scan_range) {
+        return -1;
+    }
+    *scan_ref_out = input_ref;
+    return 0;
+}
+
+static inline int open_ndx(const sqlexec_env *env,
+    const char *index_name, ndx_file *ndx)
+{
+    char index_path[path_buffer_size];
+    if (build_index_path(env->root, env->current_db,
+        index_name, index_path) != 0) {
+        return -1;
+    }
+    return ndx_open(ndx, index_path);
+}
+
+static inline int build_eq_key(ndx_file *ndx, const sql_value *value,
+    unsigned char *key_out)
+{
+    if (ndx->key_type == ndx_key_type_numeric)
+        return ndx_encode_number_key(key_out, value->text);
+    return ndx_encode_text_key(key_out, ndx->key_length, value->text);
+}
+
+static inline int build_bound_key(ndx_file *ndx, const sql_value *value,
+    unsigned char *key_out)
+{
+    if (value->type == sql_value_none || value->text[0] == '\0')
+        return -1;
+    return build_eq_key(ndx, value, key_out);
+}
+
+/* Implemented in execute_sysviews.c; called by execute_subquery.c. */
+int dispatch_builtin_view(const sqlexec_env *env,
+    const char *view_name, const char *temp_path);
+
 int exec_run_subquery(sqlexec_env *env);
 int exec_delete_temp(sqlexec_env *env);
 
-void append_projected_to_temp(const sqlexec_env *env,
+void append_projected_to_temp(exec_temp_ctx *temp,
+    const sqlexec_env *env,
     const sqlexec_project_def *project, const row_source *source);
 
 /*

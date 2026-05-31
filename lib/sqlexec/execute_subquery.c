@@ -30,8 +30,6 @@ extern int unlink(const char *path);
 #include <dirent.h>
 #endif
 
-#define temp_table_name "_tmp"
-
 /* ------------------------------------------------------------------ */
 /* Temp table path                                                      */
 /* ------------------------------------------------------------------ */
@@ -109,10 +107,11 @@ static int determine_inner_schema(const char *root, const char *db,
 /* ------------------------------------------------------------------ */
 
 /*
- * Builds one DBF record from the projected columns and appends it.
- * env->write_to_temp must be 1 and env->temp_out must be open.
+ * Builds one DBF record from the projected columns and appends it
+ * to the temp table described by ctx.
  */
-void append_projected_to_temp(const sqlexec_env *env,
+void append_projected_to_temp(exec_temp_ctx *ctx,
+    const sqlexec_env *env,
     const sqlexec_project_def *project,
     const row_source *source)
 {
@@ -123,14 +122,16 @@ void append_projected_to_temp(const sqlexec_env *env,
     unsigned short out_count;
     int fi;
     unsigned short offset;
+    unsigned short record_len;
 
     out_count = project->select_all
         ? source->field_count : project->names.count;
 
-    clear_record(record, env->temp_field_count > 0
-        ? (unsigned short)(env->temp_offsets[env->temp_field_count - 1]
-            + env->temp_fields[env->temp_field_count - 1].length)
-        : 0);
+    record_len = ctx->field_count > 0
+        ? (unsigned short)(ctx->offsets[ctx->field_count - 1]
+            + ctx->fields[ctx->field_count - 1].length)
+        : 0;
+    clear_record(record, record_len);
 
     offset = 0;
     for (i = 0; i < out_count; i++) {
@@ -148,12 +149,11 @@ void append_projected_to_temp(const sqlexec_env *env,
         trim_field_value(value, sizeof(value),
             src->record + src->offsets[fi],
             src->fields[fi].length);
-        set_field(record + offset, env->temp_fields[i].length, value);
-        offset = (unsigned short)(offset
-            + env->temp_fields[i].length);
+        set_field(record + offset, ctx->fields[i].length, value);
+        offset = (unsigned short)(offset + ctx->fields[i].length);
     }
 
-    dbf_append(env->temp_out, record);
+    dbf_append(ctx->out, record);
 }
 
 /* ------------------------------------------------------------------ */
@@ -202,74 +202,23 @@ static int exec_sql_to_temp(const char *root, const char *db,
         return -1;
     }
 
-    /*
-     * Determine the temp table schema from the inner program's
-     * open_table and project nodes.
-     */
+    /* Determine the temp table schema via the stable API. */
     {
-        const sqlexec_node *node;
-        sqlexec_ref child;
-        const char *src_table = NULL;
-        unsigned char sel_all = 1;
-        unsigned char sel_count = 0;
+        const char *src_table;
+        unsigned char sel_all;
+        sqlexec_span names;
         const char (*col_names)[sql_name_size] = NULL;
 
-        /* Find open_table node to get source table name. */
-        if (inner.program.root != sqlexec_nil) {
-            node = sqlexec_get_const(&inner.program, inner.program.root);
-            if (node && node->opcode == sqlexec_open_table) {
-                src_table = node->data.named.name;
-            } else if (node && node->opcode == sqlexec_sequence) {
-                child = node->first_child;
-                while (child != sqlexec_nil) {
-                    node = sqlexec_get_const(&inner.program, child);
-                    if (node && node->opcode == sqlexec_open_table) {
-                        src_table = node->data.named.name;
-                        break;
-                    }
-                    child = node ? node->next_sibling : sqlexec_nil;
-                }
-                /* Find project node for column list. */
-                child = sqlexec_get_const(&inner.program,
-                    inner.program.root)->first_child;
-                while (child != sqlexec_nil) {
-                    node = sqlexec_get_const(&inner.program, child);
-                    if (node && node->opcode == sqlexec_project) {
-                        sel_all = node->data.project.select_all;
-                        sel_count = node->data.project.names.count;
-                        if (!sel_all && sel_count > 0) {
-                            col_names = (const char (*)[sql_name_size])
-                                &inner.program.names[
-                                    node->data.project.names.first];
-                        }
-                        break;
-                    }
-                    if (node && node->opcode == sqlexec_emit_rows) {
-                        sqlexec_ref pr = node->first_child;
-                        node = sqlexec_get_const(&inner.program, pr);
-                        if (node && node->opcode == sqlexec_project) {
-                            sel_all = node->data.project.select_all;
-                            sel_count = node->data.project.names.count;
-                            if (!sel_all && sel_count > 0) {
-                                col_names =
-                                    (const char (*)[sql_name_size])
-                                    &inner.program.names[
-                                        node->data.project.names.first];
-                            }
-                        }
-                        break;
-                    }
-                    child = node ? node->next_sibling : sqlexec_nil;
-                }
-            }
-        }
-
-        if (!src_table) {
+        if (sqlexec_get_output_info(&inner.program, &src_table,
+            &sel_all, &names) != 0) {
             return -1;
         }
-
+        if (!sel_all && names.count > 0) {
+            col_names = (const char (*)[sql_name_size])
+                &inner.program.names[names.first];
+        }
         if (determine_inner_schema(root, db, src_table, sel_all,
-            sel_count, col_names, fields, &field_count) != 0) {
+            names.count, col_names, fields, &field_count) != 0) {
             return -1;
         }
     }
@@ -277,6 +226,7 @@ static int exec_sql_to_temp(const char *root, const char *db,
     /* Create the temp DBF. */
     {
         sqlexec_env env2;
+        exec_temp_ctx tctx;
         dbf_file temp_dbf;
         unsigned short temp_offsets[sql_max_columns];
         int ret;
@@ -286,392 +236,21 @@ static int exec_sql_to_temp(const char *root, const char *db,
         }
         build_field_offsets(fields, field_count, temp_offsets);
 
-        /* Execute inner query with output redirected to temp_dbf. */
-        env2.root = root;
-        env2.program = &inner.program;
+        tctx.out         = &temp_dbf;
+        tctx.fields      = fields;
+        tctx.offsets     = temp_offsets;
+        tctx.field_count = (unsigned short)field_count;
+
+        env2.root       = root;
+        env2.program    = &inner.program;
         env2.current_db = inner.current_db;
-        env2.io = &inner.io;
-        env2.write_to_temp = 1;
-        env2.temp_out = &temp_dbf;
-        env2.temp_fields = fields;
-        env2.temp_offsets = temp_offsets;
-        env2.temp_field_count = field_count;
+        env2.io         = &inner.io;
+        env2.temp       = &tctx;
 
         ret = sqlexec_execute_env(&env2);
         dbf_close(&temp_dbf);
         return ret;
     }
-}
-
-/* ------------------------------------------------------------------ */
-/* Built-in view generators                                             */
-/* ------------------------------------------------------------------ */
-
-static int gen_sys_databases(const sqlexec_env *env,
-    const char *temp_path)
-{
-    dbf_field fields[3];
-    dbf_file cat;
-    dbf_file tmp;
-    char catalog_path[path_buffer_size];
-    char record[catalog_record_length];
-    char name[catalog_name_length + 1];
-    char path[catalog_path_length + 1];
-    char tmp_record[catalog_name_length + catalog_path_length
-        + catalog_slot_length];
-    unsigned long i;
-    int state;
-
-    fill_catalog_fields(fields);
-    if (ensure_catalog(env->root, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_open(&cat, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_create(&tmp, temp_path, fields, 3) != 0) {
-        dbf_close(&cat);
-        return -1;
-    }
-    for (i = 0; i < cat.record_count; i++) {
-        state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
-        if (state == 1) continue;
-        get_field(name, sizeof(name), record, catalog_name_length);
-        get_field(path, sizeof(path), record + catalog_name_length,
-            catalog_path_length);
-        set_field(tmp_record, catalog_name_length, name);
-        set_field(tmp_record + catalog_name_length,
-            catalog_path_length, path);
-        tmp_record[catalog_name_length + catalog_path_length] =
-            record[catalog_name_length + catalog_path_length];
-        tmp_record[catalog_name_length + catalog_path_length + 1] =
-            record[catalog_name_length + catalog_path_length + 1];
-        dbf_append(&tmp, tmp_record);
-    }
-    dbf_close(&cat);
-    return dbf_close(&tmp);
-}
-
-#define sys_fields_table_len  16
-#define sys_fields_name_len   16
-#define sys_fields_type_len    1
-#define sys_fields_len_len     3
-#define sys_fields_dec_len     2
-#define sys_fields_pos_len     2
-#define sys_fields_record_length (sys_fields_table_len \
-    + sys_fields_name_len + sys_fields_type_len \
-    + sys_fields_len_len + sys_fields_dec_len + sys_fields_pos_len)
-
-static void fill_sys_fields_schema(dbf_field *fields)
-{
-    strcpy(fields[0].name, "table_name");
-    fields[0].type = 'C'; fields[0].length = sys_fields_table_len;
-    fields[0].decimals = 0;
-    strcpy(fields[1].name, "name");
-    fields[1].type = 'C'; fields[1].length = sys_fields_name_len;
-    fields[1].decimals = 0;
-    strcpy(fields[2].name, "type");
-    fields[2].type = 'C'; fields[2].length = sys_fields_type_len;
-    fields[2].decimals = 0;
-    strcpy(fields[3].name, "length");
-    fields[3].type = 'N'; fields[3].length = sys_fields_len_len;
-    fields[3].decimals = 0;
-    strcpy(fields[4].name, "decimals");
-    fields[4].type = 'N'; fields[4].length = sys_fields_dec_len;
-    fields[4].decimals = 0;
-    strcpy(fields[5].name, "position");
-    fields[5].type = 'N'; fields[5].length = sys_fields_pos_len;
-    fields[5].decimals = 0;
-}
-
-static void write_sys_fields_row(dbf_file *tmp, const char *table_name,
-    const dbf_field *f, unsigned char position)
-{
-    char rec[sys_fields_record_length];
-    char num[8];
-    unsigned short off;
-
-    off = 0;
-    set_field(rec + off, sys_fields_table_len, table_name); off += sys_fields_table_len;
-    set_field(rec + off, sys_fields_name_len, f->name);     off += sys_fields_name_len;
-    rec[off] = f->type;                                     off += sys_fields_type_len;
-    uint_to_str(f->length, num);
-    set_field(rec + off, sys_fields_len_len, num);          off += sys_fields_len_len;
-    uint_to_str(f->decimals, num);
-    set_field(rec + off, sys_fields_dec_len, num);          off += sys_fields_dec_len;
-    uint_to_str(position, num);
-    set_field(rec + off, sys_fields_pos_len, num);
-    dbf_append(tmp, rec);
-}
-
-static int gen_sys_fields_for_table(const sqlexec_env *env,
-    dbf_file *tmp, const char *table_name)
-{
-    dbf_file src;
-    dbf_field src_fields[sql_max_columns];
-    unsigned short offsets[sql_max_columns];
-    unsigned short i;
-
-    if (open_table_file(env->root, env->current_db, table_name,
-        &src, src_fields, offsets) != 0) {
-        return -1;
-    }
-    for (i = 0; i < src.field_count; i++) {
-        write_sys_fields_row(tmp, table_name, &src_fields[i],
-            (unsigned char)(i + 1));
-    }
-    return dbf_close(&src);
-}
-
-#if !defined(__SDCC)
-static int gen_sys_tables(const sqlexec_env *env, const char *temp_path)
-{
-    dbf_field fields[1];
-    dbf_file tmp;
-    char db_path[path_buffer_size];
-    char entry_path[path_buffer_size];
-    char rec[16];
-    DIR *dir;
-    struct dirent *ent;
-    unsigned short nlen;
-
-    strcpy(fields[0].name, "name");
-    fields[0].type = 'C'; fields[0].length = 16; fields[0].decimals = 0;
-
-    if (!env->current_db || !env->current_db[0]) {
-        return -1;
-    }
-    if (find_database_path(env->root, env->current_db, db_path) != 0) {
-        return -1;
-    }
-    if (dbf_create(&tmp, temp_path, fields, 1) != 0) {
-        return -1;
-    }
-
-    dir = opendir(db_path);
-    if (!dir) {
-        dbf_close(&tmp);
-        return -1;
-    }
-    while ((ent = readdir(dir)) != NULL) {
-        nlen = (unsigned short)strlen(ent->d_name);
-        /* Only .dbf files not starting with '_' */
-        if (nlen < 5) continue;
-        if (ent->d_name[0] == '_') continue;
-        if (ent->d_name[nlen - 4] != '.'
-            || (ent->d_name[nlen - 3] | 0x20) != 'd'
-            || (ent->d_name[nlen - 2] | 0x20) != 'b'
-            || (ent->d_name[nlen - 1] | 0x20) != 'f') continue;
-        /* Verify the file exists and is accessible */
-        if (join_path(entry_path, db_path, ent->d_name) != 0) continue;
-        /* Strip extension for the table name */
-        set_field(rec, 16, "");
-        memcpy(rec, ent->d_name, nlen - 4 < 16 ? nlen - 4 : 16);
-        dbf_append(&tmp, rec);
-    }
-    closedir(dir);
-    return dbf_close(&tmp);
-}
-
-static int gen_sys_fields_all(const sqlexec_env *env,
-    const char *temp_path)
-{
-    dbf_field schema[6];
-    dbf_file tmp;
-    char db_path[path_buffer_size];
-    char table_name[17];
-    DIR *dir;
-    struct dirent *ent;
-    unsigned short nlen;
-
-    fill_sys_fields_schema(schema);
-    if (!env->current_db || !env->current_db[0]) {
-        return -1;
-    }
-    if (find_database_path(env->root, env->current_db, db_path) != 0) {
-        return -1;
-    }
-    if (dbf_create(&tmp, temp_path, schema, 6) != 0) {
-        return -1;
-    }
-    dir = opendir(db_path);
-    if (!dir) {
-        dbf_close(&tmp);
-        return -1;
-    }
-    while ((ent = readdir(dir)) != NULL) {
-        nlen = (unsigned short)strlen(ent->d_name);
-        if (nlen < 5 || ent->d_name[0] == '_') continue;
-        if (ent->d_name[nlen - 4] != '.'
-            || (ent->d_name[nlen - 3] | 0x20) != 'd'
-            || (ent->d_name[nlen - 2] | 0x20) != 'b'
-            || (ent->d_name[nlen - 1] | 0x20) != 'f') continue;
-        memset(table_name, 0, sizeof(table_name));
-        memcpy(table_name, ent->d_name,
-            nlen - 4 < 16 ? nlen - 4 : 16);
-        gen_sys_fields_for_table(env, &tmp, table_name);
-    }
-    closedir(dir);
-    return dbf_close(&tmp);
-}
-#else
-/* CP/M: directory scan not yet implemented */
-static int gen_sys_tables(const sqlexec_env *env, const char *temp_path)
-{
-    dbf_field fields[1];
-    dbf_file tmp;
-    (void)env;
-    strcpy(fields[0].name, "name");
-    fields[0].type = 'C'; fields[0].length = 16; fields[0].decimals = 0;
-    if (dbf_create(&tmp, temp_path, fields, 1) != 0) return -1;
-    return dbf_close(&tmp);
-}
-static int gen_sys_fields_all(const sqlexec_env *env, const char *temp_path)
-{
-    dbf_field schema[6];
-    dbf_file tmp;
-    (void)env;
-    fill_sys_fields_schema(schema);
-    if (dbf_create(&tmp, temp_path, schema, 6) != 0) return -1;
-    return dbf_close(&tmp);
-}
-#endif
-
-static int gen_sys_indexes(const sqlexec_env *env, const char *temp_path)
-{
-    dbf_field fields[4];
-    dbf_file cat;
-    dbf_file tmp;
-    char catalog_path[path_buffer_size];
-    char record[index_catalog_record_length];
-    char rec_db[index_catalog_db_length + 1];
-    char rec_name[index_catalog_name_length + 1];
-    char rec_table[index_catalog_table_length + 1];
-    char rec_fields[64];
-    char rec_unique[2];
-    char tmp_record[16 + 16 + 64 + 1];
-    unsigned long i;
-    int state;
-
-    strcpy(fields[0].name, "name");
-    fields[0].type = 'C'; fields[0].length = 16; fields[0].decimals = 0;
-    strcpy(fields[1].name, "table_name");
-    fields[1].type = 'C'; fields[1].length = 16; fields[1].decimals = 0;
-    strcpy(fields[2].name, "key_fields");
-    fields[2].type = 'C'; fields[2].length = 64; fields[2].decimals = 0;
-    strcpy(fields[3].name, "unique");
-    fields[3].type = 'C'; fields[3].length = 1; fields[3].decimals = 0;
-
-    if (ensure_index_catalog(env->root, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_open(&cat, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_create(&tmp, temp_path, fields, 4) != 0) {
-        dbf_close(&cat);
-        return -1;
-    }
-    for (i = 0; i < cat.record_count; i++) {
-        state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
-        if (state == 1) continue;
-        get_field(rec_db, sizeof(rec_db), record, index_catalog_db_length);
-        if (env->current_db[0]
-            && strcmp(rec_db, env->current_db) != 0) continue;
-        get_field(rec_name, sizeof(rec_name),
-            record + index_catalog_db_length, index_catalog_name_length);
-        get_field(rec_table, sizeof(rec_table),
-            record + index_catalog_db_length + index_catalog_name_length,
-            index_catalog_table_length);
-        get_field(rec_fields, sizeof(rec_fields),
-            record + index_catalog_db_length + index_catalog_name_length
-                + index_catalog_table_length,
-            index_catalog_fields_length < 64 ? index_catalog_fields_length : 63);
-        rec_unique[0] = record[index_catalog_db_length
-            + index_catalog_name_length + index_catalog_table_length
-            + index_catalog_fields_length];
-        rec_unique[1] = '\0';
-        set_field(tmp_record, 16, rec_name);
-        set_field(tmp_record + 16, 16, rec_table);
-        set_field(tmp_record + 32, 64, rec_fields);
-        tmp_record[96] = rec_unique[0];
-        dbf_append(&tmp, tmp_record);
-    }
-    dbf_close(&cat);
-    return dbf_close(&tmp);
-}
-
-static int gen_sys_views(const sqlexec_env *env, const char *temp_path)
-{
-    dbf_field fields[2];
-    dbf_file cat;
-    dbf_file tmp;
-    char catalog_path[path_buffer_size];
-    char record[view_catalog_record_length];
-    char rec_db[view_catalog_db_length + 1];
-    char rec_name[view_catalog_name_length + 1];
-    char tmp_record[16 + 1];
-    unsigned long i;
-    int state;
-
-    strcpy(fields[0].name, "name");
-    fields[0].type = 'C'; fields[0].length = 16; fields[0].decimals = 0;
-    strcpy(fields[1].name, "type");
-    fields[1].type = 'C'; fields[1].length = 1; fields[1].decimals = 0;
-
-    if (ensure_view_catalog(env->root, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_open(&cat, catalog_path) != 0) {
-        return -1;
-    }
-    if (dbf_create(&tmp, temp_path, fields, 2) != 0) {
-        dbf_close(&cat);
-        return -1;
-    }
-    for (i = 0; i < cat.record_count; i++) {
-        state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
-        if (state == 1) continue;
-        get_field(rec_db, sizeof(rec_db), record, view_catalog_db_length);
-        if (env->current_db[0]
-            && strcmp(rec_db, env->current_db) != 0) continue;
-        get_field(rec_name, sizeof(rec_name),
-            record + view_catalog_db_length, view_catalog_name_length);
-        set_field(tmp_record, 16, rec_name);
-        tmp_record[16] = record[view_catalog_db_length
-            + view_catalog_name_length];
-        dbf_append(&tmp, tmp_record);
-    }
-    dbf_close(&cat);
-    return dbf_close(&tmp);
-}
-
-/* ------------------------------------------------------------------ */
-/* Built-in view dispatch                                               */
-/* ------------------------------------------------------------------ */
-
-static int dispatch_builtin_view(const sqlexec_env *env,
-    const char *view_name, const char *temp_path)
-{
-    if (strcmp(view_name, "sys_databases") == 0) {
-        return gen_sys_databases(env, temp_path);
-    }
-    if (strcmp(view_name, "sys_tables") == 0) {
-        return gen_sys_tables(env, temp_path);
-    }
-    if (strcmp(view_name, "sys_fields") == 0) {
-        return gen_sys_fields_all(env, temp_path);
-    }
-    if (strcmp(view_name, "sys_indexes") == 0) {
-        return gen_sys_indexes(env, temp_path);
-    }
-    if (strcmp(view_name, "sys_views") == 0) {
-        return gen_sys_views(env, temp_path);
-    }
-    return -1;
 }
 
 /* ------------------------------------------------------------------ */

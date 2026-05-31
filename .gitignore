@@ -3,6 +3,9 @@ build/
 bin/
 
 # Ignore AI settings
+.codex/
+.claude/
+.agents/
 
 # Ignore orig directories
 orig/

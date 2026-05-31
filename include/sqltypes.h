@@ -13,7 +13,7 @@
 
 #define sql_name_size 17
 #define sql_max_columns 16
-#define sql_value_size 33
+#define sql_value_size 34   /* 33 chars + null; accommodates "qualifier.name" for column refs */
 #define sql_where_max_nodes 16
 #define sql_where_max_values 16
 #define sql_where_nil 0xffu

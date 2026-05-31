@@ -39,7 +39,7 @@ update          ::= UPDATE <name> SET assignment [, assignment ...]
                     [where_clause] ;
 delete          ::= DELETE FROM <name> [where_clause] ;
 
-select_list     ::= * | COUNT(*) | select_item [, select_item ...]
+select_list     ::= * | COUNT(*) | COUNT(expr) | select_item [, select_item ...]
 select_item     ::= column_ref [ [ AS ] column_name ]
 from_item       ::= <name> [ [ AS ] alias ]
                   | ( select_body ) [ [ AS ] alias ]
@@ -160,15 +160,22 @@ sequence
   delete_temp _tmp
 ```
 
-`SELECT p.name, c.city FROM people p JOIN cities c ON p.city = c.code;`
+`SELECT p.name, c.label FROM people p JOIN cities c ON p.city = c.code WHERE c.region = 'EU';`
 ```
 sequence
   open_table people
   emit_rows
-    project p.name, c.city
-      join_scan people as p join cities as c on p.city = c.code
+    project p.name, c.label
+      filter (c.region = 'EU') AND (p.city = c.code)
+        join_scan people as p join cities as c
   close_table
 ```
+
+The JOIN ON condition is merged into the WHERE tree at parse time. The
+right-hand column of the ON equality (`c.code`) is encoded as a
+`sql_value_identifier` string `"c.code"`. The filter evaluator resolves
+both column sides against all active row sources using the N-source
+`where_matches_n` path — no separate join-key check in the executor.
 
 `INSERT INTO people VALUES ('alice', 30, T);`
 ```
@@ -232,6 +239,12 @@ The `filter` node stays in place after rewrite as a correctness guard.
 - `run_subquery` parses and executes the inner SQL (or calls a
   built-in generator), writing projected rows into `_tmp.dbf`
 - `delete_temp` removes `_tmp.dbf` after the outer query closes it
+
+**Join execution:**
+For join queries, the ON condition lives in the WHERE tree as a compare
+node. The executor opens both tables and evaluates the unified WHERE
+tree (ON condition + regular WHERE) against both row sources using the
+N-source `where_matches_n` evaluator. No separate join-key check.
 
 **Index maintenance:**
 Every registered index for the affected table is rebuilt after every
