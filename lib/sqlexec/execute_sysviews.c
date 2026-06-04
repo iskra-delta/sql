@@ -11,6 +11,7 @@
 #include "exec_impl.h"
 #include "metacache.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__SDCC)
@@ -32,7 +33,7 @@ static int gen_sys_databases(const sqlexec_env *env,
     dbf_file cat;
     dbf_file tmp;
     char catalog_path[path_buffer_size];
-    char record[catalog_record_length];
+    char *record;
     char name[catalog_name_length + 1];
     char path[catalog_path_length + 1];
     char tmp_record[catalog_name_length + catalog_path_length
@@ -51,9 +52,17 @@ static int gen_sys_databases(const sqlexec_env *env,
         dbf_close(&cat);
         return -1;
     }
+    record = (char *)malloc(catalog_record_length);
+    if (!record) {
+        dbf_close(&cat);
+        dbf_close(&tmp);
+        return -1;
+    }
     for (i = 0; i < cat.record_count; i++) {
         state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
+        if (state < 0) {
+            free(record); dbf_close(&cat); dbf_close(&tmp); return -1;
+        }
         if (state == 1) continue;
         get_field(name, sizeof(name), record, catalog_name_length);
         get_field(path, sizeof(path), record + catalog_name_length,
@@ -67,6 +76,7 @@ static int gen_sys_databases(const sqlexec_env *env,
             record[catalog_name_length + catalog_path_length + 1];
         dbf_append(&tmp, tmp_record);
     }
+    free(record);
     dbf_close(&cat);
     return dbf_close(&tmp);
 }
@@ -127,18 +137,23 @@ static int gen_sys_fields_for_table(const sqlexec_env *env,
     dbf_file *tmp, const char *table_name)
 {
     dbf_file src;
-    dbf_field src_fields[sql_max_columns];
+    dbf_field *src_fields;
     unsigned short offsets[sql_max_columns];
     unsigned short i;
 
+    src_fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!src_fields)
+        return -1;
     if (open_table_file(env->root, env->current_db, table_name,
         &src, src_fields, offsets) != 0) {
+        free(src_fields);
         return -1;
     }
     for (i = 0; i < src.field_count; i++) {
         write_sys_fields_row(tmp, table_name, &src_fields[i],
             (unsigned char)(i + 1));
     }
+    free(src_fields);
     return dbf_close(&src);
 }
 
@@ -275,7 +290,7 @@ static int gen_sys_indexes(const sqlexec_env *env, const char *temp_path)
     dbf_file cat;
     dbf_file tmp;
     char catalog_path[path_buffer_size];
-    char record[index_catalog_record_length];
+    char *record;
     char rec_db[index_catalog_db_length + 1];
     char rec_name[index_catalog_name_length + 1];
     char rec_table[index_catalog_table_length + 1];
@@ -304,9 +319,17 @@ static int gen_sys_indexes(const sqlexec_env *env, const char *temp_path)
         dbf_close(&cat);
         return -1;
     }
+    record = (char *)malloc(index_catalog_record_length);
+    if (!record) {
+        dbf_close(&cat);
+        dbf_close(&tmp);
+        return -1;
+    }
     for (i = 0; i < cat.record_count; i++) {
         state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
+        if (state < 0) {
+            free(record); dbf_close(&cat); dbf_close(&tmp); return -1;
+        }
         if (state == 1) continue;
         get_field(rec_db, sizeof(rec_db), record, index_catalog_db_length);
         if (env->current_db[0]
@@ -330,6 +353,7 @@ static int gen_sys_indexes(const sqlexec_env *env, const char *temp_path)
         tmp_record[96] = rec_unique[0];
         dbf_append(&tmp, tmp_record);
     }
+    free(record);
     dbf_close(&cat);
     return dbf_close(&tmp);
 }
@@ -340,7 +364,7 @@ static int gen_sys_views(const sqlexec_env *env, const char *temp_path)
     dbf_file cat;
     dbf_file tmp;
     char catalog_path[path_buffer_size];
-    char record[view_catalog_record_length];
+    char *record;
     char rec_db[view_catalog_db_length + 1];
     char rec_name[view_catalog_name_length + 1];
     char tmp_record[16 + 1];
@@ -362,9 +386,17 @@ static int gen_sys_views(const sqlexec_env *env, const char *temp_path)
         dbf_close(&cat);
         return -1;
     }
+    record = (char *)malloc(view_catalog_record_length);
+    if (!record) {
+        dbf_close(&cat);
+        dbf_close(&tmp);
+        return -1;
+    }
     for (i = 0; i < cat.record_count; i++) {
         state = dbf_read(&cat, i, record);
-        if (state < 0) { dbf_close(&cat); dbf_close(&tmp); return -1; }
+        if (state < 0) {
+            free(record); dbf_close(&cat); dbf_close(&tmp); return -1;
+        }
         if (state == 1) continue;
         get_field(rec_db, sizeof(rec_db), record, view_catalog_db_length);
         if (env->current_db[0]
@@ -376,6 +408,7 @@ static int gen_sys_views(const sqlexec_env *env, const char *temp_path)
             + view_catalog_name_length];
         dbf_append(&tmp, tmp_record);
     }
+    free(record);
     dbf_close(&cat);
     return dbf_close(&tmp);
 }

@@ -20,6 +20,9 @@ statement ::= create_database
             | insert
             | update
             | delete
+            | begin
+            | commit
+            | rollback
 
 create_database ::= CREATE DATABASE <name> ;
 show_databases  ::= SHOW DATABASES ;
@@ -42,6 +45,9 @@ insert          ::= INSERT INTO <name>
 update          ::= UPDATE <name> SET assignment [, assignment ...]
                     [where_clause] ;
 delete          ::= DELETE FROM <name> [where_clause] ;
+begin           ::= BEGIN ;
+commit          ::= COMMIT ;
+rollback        ::= ROLLBACK ;
 
 select_list     ::= * | COUNT(*) | select_item [, select_item ...]
 select_item     ::= column_ref [ [ AS ] column_name ]
@@ -146,7 +152,7 @@ outer query and removes it afterward.
 The parser builds a `sqlexec_program` — a fixed-size node arena with
 child/sibling links and no heap allocation.
 
-Key sizes: 3 nodes, 64 pooled names, 241-byte subquery text.
+Key sizes: 2 nodes, 24 pooled names, 241-byte subquery text.
 
 ### Opcode groups
 
@@ -154,6 +160,9 @@ Key sizes: 3 nodes, 64 pooled names, 241-byte subquery text.
 `create_database`, `use_database`, `drop_database`,
 `create_table`, `drop_table`, `create_index`,
 `create_view`, `drop_view`, `show_views`
+
+**Transactions:**
+`sqlexec_begin`, `sqlexec_commit`, `sqlexec_rollback`
 
 **Query:**
 `table_scan`, `join_scan`, `project`
@@ -405,21 +414,31 @@ tables or views.
 | Columns per table | 16 |
 | Identifier length | 16 characters |
 | Value text length | 33 characters |
-| Plan nodes per statement | 20 |
-| Pooled names per plan | 64 |
+| Plan nodes per statement | 2 |
+| Pooled names per plan | 24 |
 | Row sources per SELECT | 4 |
 | JOIN clauses per SELECT | 3 |
-| WHERE nodes per statement | 48 |
-| WHERE values per statement | 32 |
-| HAVING nodes per statement | 48 |
-| HAVING values per statement | 32 |
+| WHERE nodes per statement | 24 |
+| WHERE values per statement | 16 |
+| HAVING nodes per statement | 24 |
+| HAVING values per statement | 16 |
+| Predicate subqueries per statement | 2 |
 | Distinct groups per grouped SELECT | 8 |
 | Subquery nesting | 1 level |
-| Maximum record buffer | 4096 bytes |
+| Maximum record buffer | heap-allocated (actual record length) |
 | View SQL text length | 240 characters |
 
-Practical WHERE capacity depends on shape. A flat `AND` chain of simple
-comparisons uses one compare node plus one connector node per extra
-term, so the current 48-node budget fits up to 24 simple predicates in
-single-table queries. JOIN `ON` conditions and `IN (...)` lists consume
-the same fixed pools.
+Practical WHERE capacity: a flat AND chain uses one compare node plus
+one AND node per extra term, so the 24-node budget fits up to 12 simple
+predicates in single-table queries.  JOIN ON conditions and IN (...)
+lists share the same pool.
+
+### `BEGIN` / `COMMIT` / `ROLLBACK`
+
+Opens, commits, or rolls back a transaction.  While a transaction is
+open all DML (INSERT, UPDATE, DELETE) is held in an in-memory log and
+is not written to the real tables.  SELECT reads show the pending
+changes as if they were committed.  COMMIT runs a CRC-16 precondition
+check on every updated/deleted row; if any row changed externally,
+COMMIT returns an error and the transaction remains open for the caller
+to ROLLBACK and retry.  DDL is not permitted inside an open transaction.

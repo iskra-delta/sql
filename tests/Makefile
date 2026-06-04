@@ -10,6 +10,7 @@ libndx_dir ?= ../lib/ndx
 libsql_dir ?= ../lib/sql
 libsqlexec_dir ?= ../lib/sqlexec
 libsqlopt_dir ?= ../lib/sqlopt
+libtran_dir   ?= ../lib/tran
 
 test_sources := test_dbf.c test_ndx.c test_sql.c test_sqlexec.c \
 	test_sqlopt.c test_sql_exec.c
@@ -23,6 +24,7 @@ libndx_archive := $(build_dir)/libndx.a
 libsql_archive := $(build_dir)/libsql.a
 libsqlexec_archive := $(build_dir)/libsqlexec.a
 libsqlopt_archive := $(build_dir)/libsqlopt.a
+libtran_archive   := $(build_dir)/libtran.a
 
 cflags := -std=c11 -I$(include_dir) -Wall -Wextra -pedantic \
 	-g -fsanitize=address,undefined -DSQLEXEC_DEBUG
@@ -38,7 +40,7 @@ sql_app := $(bin_dir)/sql
 
 .PHONY: all test clean force_libcommon force_libcatalog force_libdbf \
 	force_libndx force_libsql force_libsqlexec force_libsqlopt \
-	force_sql_app
+	force_libtran force_sql_app
 
 all: test
 
@@ -62,30 +64,30 @@ $(ndx_target): $(build_dir)/test_test_ndx.o $(libndx_archive) \
 
 $(sql_target): $(build_dir)/test_test_sql.o $(libsql_archive) \
 		$(libcommon_archive) $(libcatalog_archive) \
-		$(libsqlexec_archive) \
+		$(libsqlexec_archive) $(libtran_archive) \
 		$(libdbf_archive) | $(bin_dir)
 	$(cc) $(build_dir)/test_test_sql.o \
-		$(libsql_archive) $(libsqlexec_archive) \
+		$(libsql_archive) $(libsqlexec_archive) $(libtran_archive) \
 		$(libcatalog_archive) $(libcommon_archive) \
 		$(libdbf_archive) \
 		$(ldflags) -o $@
 
 $(sqlexec_target): $(build_dir)/test_test_sqlexec.o \
-		$(libsqlexec_archive) $(libsql_archive) \
+		$(libsqlexec_archive) $(libtran_archive) $(libsql_archive) \
 		$(libsqlopt_archive) $(libcommon_archive) $(libcatalog_archive) \
 		$(libndx_archive) $(libdbf_archive) | $(bin_dir)
 	$(cc) $(build_dir)/test_test_sqlexec.o \
-		$(libsqlexec_archive) $(libsql_archive) \
+		$(libsqlexec_archive) $(libtran_archive) $(libsql_archive) \
 		$(libsqlopt_archive) $(libcatalog_archive) $(libcommon_archive) \
 		$(libndx_archive) $(libdbf_archive) \
 		$(ldflags) -o $@
 
 $(sqlopt_target): $(build_dir)/test_test_sqlopt.o \
-		$(libsqlopt_archive) $(libsqlexec_archive) \
+		$(libsqlopt_archive) $(libsqlexec_archive) $(libtran_archive) \
 		$(libsql_archive) $(libcommon_archive) $(libcatalog_archive) \
 		$(libndx_archive) $(libdbf_archive) | $(bin_dir)
 	$(cc) $(build_dir)/test_test_sqlopt.o \
-		$(libsqlopt_archive) $(libsqlexec_archive) \
+		$(libsqlopt_archive) $(libsqlexec_archive) $(libtran_archive) \
 		$(libsql_archive) $(libcatalog_archive) $(libcommon_archive) \
 		$(libndx_archive) $(libdbf_archive) \
 		$(ldflags) -o $@
@@ -141,6 +143,14 @@ $(libsqlopt_archive): force_libsqlopt
 		include_dir=$(abspath $(include_dir)) \
 		build_dir=$(abspath $(build_dir))
 
+$(libtran_archive): force_libtran
+	$(MAKE) -C $(libtran_dir) debug cc=$(cc) \
+		include_dir=$(abspath $(include_dir)) \
+		build_dir=$(abspath $(build_dir)) \
+		common_dir=$(abspath $(libcommon_dir)) \
+		catalog_dir=$(abspath $(libcatalog_dir)) \
+		sqlexec_dir=$(abspath $(libsqlexec_dir))
+
 $(sql_app): force_sql_app
 	$(MAKE) -C $(src_dir) debug cc=$(cc) \
 		include_dir=$(abspath $(include_dir)) \
@@ -152,7 +162,8 @@ $(sql_app): force_sql_app
 		libcatalog_dir=$(abspath $(libcatalog_dir)) \
 		libsql_dir=$(abspath $(libsql_dir)) \
 		libsqlexec_dir=$(abspath $(libsqlexec_dir)) \
-		libsqlopt_dir=$(abspath $(libsqlopt_dir))
+		libsqlopt_dir=$(abspath $(libsqlopt_dir)) \
+		libtran_dir=$(abspath $(libtran_dir))
 
 clean:
 	rm -f $(build_dir)/test_test_dbf.o $(build_dir)/test_test_dbf.d

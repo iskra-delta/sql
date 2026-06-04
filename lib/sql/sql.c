@@ -181,7 +181,10 @@ enum {
     sql_keyword_values,
     sql_keyword_view,
     sql_keyword_views,
-    sql_keyword_where
+    sql_keyword_where,
+    sql_keyword_begin,
+    sql_keyword_commit,
+    sql_keyword_rollback
 };
 
 typedef struct sql_keyword_entry {
@@ -238,7 +241,10 @@ static const sql_keyword_entry sql_keywords[] = {
     { "VALUES", sql_keyword_values },
     { "VIEW", sql_keyword_view },
     { "VIEWS", sql_keyword_views },
-    { "WHERE", sql_keyword_where }
+    { "WHERE",    sql_keyword_where },
+    { "BEGIN",    sql_keyword_begin },
+    { "COMMIT",   sql_keyword_commit },
+    { "ROLLBACK", sql_keyword_rollback }
 };
 
 typedef struct sql_token {
@@ -2385,6 +2391,13 @@ static const char *parse_delete(sql_lexer *lexer, sql_statement *stmt)
     return lexer_position(lexer);
 }
 
+static const char *parse_transaction(sql_lexer *lexer,
+    sql_statement *stmt, sql_statement_type type)
+{
+    stmt->type = type;
+    return lexer_position(lexer);
+}
+
 static const char *parse_statement_lexer(sql_lexer *lexer,
     sql_statement *stmt)
 {
@@ -2405,6 +2418,12 @@ static const char *parse_statement_lexer(sql_lexer *lexer,
         return parse_update(lexer, stmt);
     case sql_keyword_delete:
         return parse_delete(lexer, stmt);
+    case sql_keyword_begin:
+        return parse_transaction(lexer, stmt, sql_statement_begin);
+    case sql_keyword_commit:
+        return parse_transaction(lexer, stmt, sql_statement_commit);
+    case sql_keyword_rollback:
+        return parse_transaction(lexer, stmt, sql_statement_rollback);
     default:
         break;
     }

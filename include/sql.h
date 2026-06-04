@@ -32,7 +32,10 @@ enum {
     sql_statement_select,
     sql_statement_insert,
     sql_statement_update,
-    sql_statement_delete
+    sql_statement_delete,
+    sql_statement_begin,
+    sql_statement_commit,
+    sql_statement_rollback
 };
 
 typedef struct sql_select_item {

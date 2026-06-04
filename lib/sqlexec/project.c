@@ -12,6 +12,8 @@
 
 #include "exec_impl.h"
 
+#include <stdlib.h>
+
 static void init_project_binding(exec_project_binding *binding)
 {
     unsigned short index;
@@ -445,11 +447,12 @@ int exec_append_output_values_to_temp(exec_temp_ctx *ctx,
     char output_values[sql_max_columns][sql_value_size],
     unsigned short output_count)
 {
-    char record[table_record_size];
+    char *record;
     sql_value stored_value;
     unsigned short offset;
     unsigned short index;
     unsigned short record_len;
+    int ret;
 
     if (output_count != ctx->field_count) {
         return -1;
@@ -459,6 +462,11 @@ int exec_append_output_values_to_temp(exec_temp_ctx *ctx,
         ? (unsigned short)(ctx->offsets[ctx->field_count - 1]
             + ctx->fields[ctx->field_count - 1].length)
         : 0;
+
+    record = (char *)malloc(record_len > 0 ? record_len : 1);
+    if (!record) {
+        return -1;
+    }
     clear_record(record, record_len);
 
     offset = 0;
@@ -473,12 +481,15 @@ int exec_append_output_values_to_temp(exec_temp_ctx *ctx,
         }
         if (store_value_in_field(record + offset, &ctx->fields[index],
             &stored_value) != 0) {
+            free(record);
             return -1;
         }
         offset = (unsigned short)(offset + ctx->fields[index].length);
     }
 
-    return dbf_append(ctx->out, record);
+    ret = dbf_append(ctx->out, record);
+    free(record);
+    return ret;
 }
 
 int exec_collect_output_values(exec_collect_ctx *collect,

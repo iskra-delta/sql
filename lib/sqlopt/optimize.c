@@ -13,6 +13,7 @@
 #include "../common/common.h"
 #include "../catalog/catalog.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct range_candidate {
@@ -1563,21 +1564,30 @@ static int bind_where_slots_ref(sqlexec_program *program,
 static void annotate_where_bound_slots(sqlexec_program *program,
     const char *root, const char *db_name)
 {
-    predicate_source_meta sources[sql_max_sources];
+    predicate_source_meta *sources;
     unsigned char source_count;
 
     clear_where_bound_slots(program);
     if (!program->where.active
         || program->where.root == (unsigned char)sql_where_nil
-        || program->where.root >= program->where.node_count
-        || collect_plan_source_meta(program, root, db_name, sources,
+        || program->where.root >= program->where.node_count) {
+        return;
+    }
+    sources = (predicate_source_meta *)malloc(
+        sql_max_sources * sizeof(predicate_source_meta));
+    if (!sources)
+        return;
+    memset(sources, 0, sql_max_sources * sizeof(predicate_source_meta));
+    if (collect_plan_source_meta(program, root, db_name, sources,
             &source_count) != 0
         || bind_where_slots_ref(program, &program->where, program->where.root,
             sources, source_count) != 0) {
         clear_where_bound_slots(program);
+        free(sources);
         return;
     }
     program->where_bound_slot_count = program->where.node_count;
+    free(sources);
 }
 
 /*
@@ -1591,7 +1601,7 @@ static int find_matching_index(const char *root, const char *db_name,
 {
     dbf_file file;
     char catalog_path[path_buffer_size];
-    char record[index_catalog_record_length];
+    char *record;
     char record_db[index_catalog_db_length + 1];
     char record_name[index_catalog_name_length + 1];
     char record_table[index_catalog_table_length + 1];
@@ -1606,9 +1616,15 @@ static int find_matching_index(const char *root, const char *db_name,
     if (dbf_open(&file, catalog_path) != 0) {
         return 1;
     }
+    record = (char *)malloc(index_catalog_record_length);
+    if (!record) {
+        dbf_close(&file);
+        return 1;
+    }
     for (index = 0; index < file.record_count; index++) {
         state = dbf_read(&file, index, record);
         if (state < 0) {
+            free(record);
             dbf_close(&file);
             return 1;
         }
@@ -1637,9 +1653,11 @@ static int find_matching_index(const char *root, const char *db_name,
             continue;
         }
         copy_name(index_name, record_name);
+        free(record);
         dbf_close(&file);
         return 0;
     }
+    free(record);
     dbf_close(&file);
     return 1;
 }
@@ -1801,9 +1819,10 @@ static int optimize_table_scan(sqlexec_program *program, const char *root,
     const char *db_name, const char *table_name)
 {
     sqlexec_node *scan_node;
-    dbf_field fields[sql_max_columns];
+    dbf_field *fields;
     unsigned short field_count;
     sqlexec_ref scan_ref;
+    int ret;
 
     scan_ref = find_plan_scan_ref(program);
     scan_node = sqlexec_get(program, scan_ref);
@@ -1811,13 +1830,22 @@ static int optimize_table_scan(sqlexec_program *program, const char *root,
         return 0;
     }
     reset_scan_access(scan_node);
-    if (!program->where.active || program->where.root >= program->where.node_count
-        || open_table_fields(root, db_name, table_name, fields,
-            &field_count) != 0) {
+    if (!program->where.active
+        || program->where.root >= program->where.node_count) {
         return 0;
     }
-    return choose_access_path(program, scan_ref, fields, field_count, root,
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields)
+        return 0;
+    if (open_table_fields(root, db_name, table_name, fields,
+        &field_count) != 0) {
+        free(fields);
+        return 0;
+    }
+    ret = choose_access_path(program, scan_ref, fields, field_count, root,
         db_name, table_name);
+    free(fields);
+    return ret;
 }
 
 int sqlopt_optimize(sqlexec_program *program, const char *root,

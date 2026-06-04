@@ -24,6 +24,16 @@
 /* Forward declaration to avoid pulling stdlib.h into every consumer. */
 struct meta_cache;
 
+/* Transaction log node types — defined in full in lib/tran/tran.h. */
+struct txn_entry;
+struct txn_stmt;
+
+typedef struct sql_txn {
+    unsigned char     active;
+    struct txn_entry *entries;
+    struct txn_stmt  *stmts;
+} sql_txn;
+
 typedef struct sql_context {
     const char       *root;                   /* storage root path */
     char              current_db[sql_name_size]; /* active db; DDL may change */
@@ -32,6 +42,7 @@ typedef struct sql_context {
     sqlexec_io        io;                     /* output callback */
     int               result;                 /* last phase result: 0=ok, -1=error */
     struct meta_cache *schema;               /* NULL until USE; rebuilt on schema change */
+    sql_txn           txn;                   /* transaction state; active=0 by default */
 } sql_context;
 
 /*

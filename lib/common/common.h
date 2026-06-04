@@ -132,4 +132,58 @@ void copy_subquery(char *dest, const char *src);
  */
 unsigned long ndx_to_dbf_index(unsigned long ndx_record);
 
+/*
+ * Computes CRC-16/CCITT of length bytes starting at data.
+ * Used by the transaction layer to snapshot record content for
+ * precondition checking at COMMIT time.
+ */
+unsigned short crc16(const char *data, unsigned short length);
+
+/* ------------------------------------------------------------------ */
+/* Intrusive singly-linked list                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Embed list_item as the FIRST member of any struct that participates
+ * in a list, then cast freely between list_item * and the struct *.
+ */
+typedef struct list_item {
+    struct list_item *next;
+} list_item;
+
+typedef int (*list_match_fn)(list_item *item, void *arg);
+
+/*
+ * Default match: returns 1 when item == arg (pointer identity).
+ */
+int list_match_eq(list_item *item, void *arg);
+
+/*
+ * Returns the first item for which match returns non-zero.
+ * Writes the predecessor into *prev_out (NULL when item is the head).
+ * Returns NULL when no item matches.
+ */
+list_item *list_find(list_item *first, list_item **prev_out,
+    list_match_fn match, void *arg);
+
+/*
+ * Inserts el at the head of the list.  Returns el.
+ */
+list_item *list_insert(list_item **first, list_item *el);
+
+/*
+ * Appends el to the tail of the list.  Returns el.
+ */
+list_item *list_append(list_item **first, list_item *el);
+
+/*
+ * Removes el from the list.  Returns el, or NULL when not found.
+ */
+list_item *list_remove(list_item **first, list_item *el);
+
+/*
+ * Removes and returns the head element, or NULL when the list is empty.
+ */
+list_item *list_remove_first(list_item **first);
+
 #endif

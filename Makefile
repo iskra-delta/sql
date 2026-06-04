@@ -40,6 +40,12 @@ debug:
 		include_dir=$(root_dir)/$(include_dir) \
 		common_dir=$(root_dir)/lib/common \
 		catalog_dir=$(root_dir)/lib/catalog
+	$(MAKE) -C lib/tran debug cc=$(cc) sdcc=$(sdcc) \
+		build_dir=$(root_dir)/$(build_dir) \
+		include_dir=$(root_dir)/$(include_dir) \
+		common_dir=$(root_dir)/lib/common \
+		catalog_dir=$(root_dir)/lib/catalog \
+		sqlexec_dir=$(root_dir)/lib/sqlexec
 	$(MAKE) -C src debug cc=$(cc) sdcc=$(sdcc) \
 		build_dir=$(root_dir)/$(build_dir) bin_dir=$(root_dir)/$(bin_dir) \
 		include_dir=$(root_dir)/$(include_dir) \
@@ -80,6 +86,12 @@ release:
 		include_dir=$(root_dir)/$(include_dir) \
 		common_dir=$(root_dir)/lib/common \
 		catalog_dir=$(root_dir)/lib/catalog
+	$(MAKE) -C lib/tran release cc=$(cc) sdcc=$(sdcc) \
+		build_dir=$(root_dir)/$(build_dir) \
+		include_dir=$(root_dir)/$(include_dir) \
+		common_dir=$(root_dir)/lib/common \
+		catalog_dir=$(root_dir)/lib/catalog \
+		sqlexec_dir=$(root_dir)/lib/sqlexec
 	$(MAKE) -C src release cc=$(cc) sdcc=$(sdcc) \
 		build_dir=$(root_dir)/$(build_dir) bin_dir=$(root_dir)/$(bin_dir) \
 		include_dir=$(root_dir)/$(include_dir) \

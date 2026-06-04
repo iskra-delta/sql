@@ -85,7 +85,7 @@ static int execute_create_database(sqlexec_env *env, const char *name)
     char catalog_path[path_buffer_size];
     char db_path[path_buffer_size];
     char slot_name[6];
-    char record[catalog_record_length];
+    char *record;
     unsigned short slot;
 
     if (ensure_catalog(env->root, catalog_path) != 0) {
@@ -107,13 +107,20 @@ static int execute_create_database(sqlexec_env *env, const char *name)
         dbf_close(&file);
         return -1;
     }
+    record = (char *)malloc(catalog_record_length);
+    if (!record) {
+        dbf_close(&file);
+        return -1;
+    }
     set_field(record, catalog_name_length, name);
     set_field(record + catalog_name_length, catalog_path_length, db_path);
     set_slot_field(record + catalog_name_length + catalog_path_length, slot);
     if (dbf_append(&file, record) != 0) {
+        free(record);
         dbf_close(&file);
         return -1;
     }
+    free(record);
     if (dbf_close(&file) != 0) {
         return -1;
     }
@@ -144,7 +151,7 @@ static int execute_drop_database(sqlexec_env *env, const char *name)
 {
     dbf_file file;
     char catalog_path[path_buffer_size];
-    char record[catalog_record_length];
+    char *record;
     char existing_name[catalog_name_length + 1];
     unsigned long index;
     int state;
@@ -155,9 +162,15 @@ static int execute_drop_database(sqlexec_env *env, const char *name)
     if (dbf_open(&file, catalog_path) != 0) {
         return -1;
     }
+    record = (char *)malloc(catalog_record_length);
+    if (!record) {
+        dbf_close(&file);
+        return -1;
+    }
     for (index = 0; index < file.record_count; index++) {
         state = dbf_read(&file, index, record);
         if (state < 0) {
+            free(record);
             dbf_close(&file);
             return -1;
         }
@@ -168,13 +181,16 @@ static int execute_drop_database(sqlexec_env *env, const char *name)
             catalog_name_length);
         if (strcmp(existing_name, name) == 0) {
             if (remove_registered_indexes(env->root, name, NULL) != 0) {
+                free(record);
                 dbf_close(&file);
                 return -1;
             }
             if (dbf_delete(&file, index) != 0) {
+                free(record);
                 dbf_close(&file);
                 return -1;
             }
+            free(record);
             if (dbf_close(&file) != 0) {
                 return -1;
             }
@@ -188,6 +204,7 @@ static int execute_drop_database(sqlexec_env *env, const char *name)
             return 0;
         }
     }
+    free(record);
     dbf_close(&file);
     return -1;
 }
@@ -228,7 +245,7 @@ static int execute_create_table(sqlexec_env *env,
     const sqlexec_table_def *table_def)
 {
     dbf_file file;
-    dbf_field fields[sql_max_columns];
+    dbf_field *fields;
     char db_path[path_buffer_size];
     char table_path[path_buffer_size];
     unsigned short index;
@@ -236,18 +253,25 @@ static int execute_create_table(sqlexec_env *env,
     if (!env->current_db || !env->current_db[0]) {
         return -1;
     }
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields)
+        return -1;
     if (find_database_path(env->root, env->current_db, db_path) != 0) {
+        free(fields);
         return -1;
     }
     if (join_path(table_path, db_path, table_def->name) != 0) {
+        free(fields);
         return -1;
     }
     if ((unsigned short)(strlen(table_path) + 5) > path_buffer_size) {
+        free(fields);
         return -1;
     }
     strcat(table_path, ".dbf");
     if (dbf_open(&file, table_path) == 0) {
         dbf_close(&file);
+        free(fields);
         return -1;
     }
     for (index = 0; index < table_def->columns.count; index++) {
@@ -266,8 +290,10 @@ static int execute_create_table(sqlexec_env *env,
     }
     if (dbf_create(&file, table_path, fields,
         table_def->columns.count) != 0) {
+        free(fields);
         return -1;
     }
+    free(fields);
     if (dbf_close(&file) != 0) {
         return -1;
     }
@@ -283,72 +309,95 @@ static int execute_create_index(sqlexec_env *env,
 {
     dbf_file table;
     dbf_file catalog;
-    dbf_field fields[sql_max_columns];
+    dbf_field *fields;
     unsigned short offsets[sql_max_columns];
     unsigned short key_fields[sql_max_columns];
     ndx_file index;
     char catalog_path[path_buffer_size];
     char index_path[path_buffer_size];
-    char field_list[index_catalog_fields_length + 1];
+    char *field_list;
     int present;
+
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields)
+        return -1;
+    field_list = (char *)malloc(index_catalog_fields_length + 1);
+    if (!field_list) {
+        free(fields);
+        return -1;
+    }
 
     if (open_table_file(env->root, env->current_db,
         index_def->table_name, &table, fields, offsets) != 0) {
+        free(field_list); free(fields);
         return -1;
     }
     if (resolve_index_key_fields(fields, table.field_count,
         env->program, index_def->key_names, key_fields) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (build_index_field_list(fields, key_fields,
         index_def->key_names.count, field_list,
-        sizeof(field_list)) != 0) {
+        (unsigned short)(index_catalog_fields_length + 1)) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (ensure_index_catalog(env->root, catalog_path) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (dbf_open(&catalog, catalog_path) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     present = index_catalog_has_name(&catalog, env->current_db,
         index_def->index_name);
     if (dbf_close(&catalog) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (present != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (build_index_path(env->root, env->current_db,
         index_def->index_name, index_path) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
     if (ndx_create(&index, index_path, &table, fields, table.field_count,
         key_fields, index_def->key_names.count,
         index_def->unique) != 0) {
+        free(field_list); free(fields);
         dbf_close(&table);
         return -1;
     }
+    free(fields);
     if (ndx_close(&index) != 0) {
+        free(field_list);
         dbf_close(&table);
         return -1;
     }
     if (dbf_close(&table) != 0) {
+        free(field_list);
         return -1;
     }
     if (append_index_catalog_entry(env->root, env->current_db,
         index_def->index_name, index_def->table_name, field_list,
         index_def->unique) != 0) {
+        free(field_list);
         unlink(index_path);
         return -1;
     }
+    free(field_list);
     ddl_write_str(env, "created index ");
     ddl_write_str(env, index_def->index_name);
     ddl_write_nl(env);
@@ -396,6 +445,10 @@ static int execute_drop_view(sqlexec_env *env, const char *name)
 int exec_ddl(sqlexec_env *env)
 {
     const sqlexec_node *root_node;
+
+    /* DDL is not permitted inside an open transaction. */
+    if (env->txn && env->txn->active)
+        return -1;
 
     root_node = sqlexec_get_const(env->program, env->program->root);
     if (!root_node) {

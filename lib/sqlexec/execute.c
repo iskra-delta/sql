@@ -11,6 +11,7 @@
 
 #include "exec_impl.h"
 #include "sqlctx.h"
+#include "../tran/tran.h"
 
 #include <string.h>
 
@@ -39,17 +40,32 @@ static int is_select_head(sqlexec_opcode opcode)
  * that the redirected-output fields are respected when executing inner
  * queries for temp materialisation or predicate-subquery collection.
  */
+static int is_dml_root(sqlexec_opcode opcode)
+{
+    return opcode == sqlexec_append_record
+        || opcode == sqlexec_write_current
+        || opcode == sqlexec_delete_current;
+}
+
 static int sqlexec_dispatch(sqlexec_env *env)
 {
     const sqlexec_program *program;
     const sqlexec_node *root_node;
     const char *table_name;
+    int ret;
 
     program = env->program;
 
     root_node = sqlexec_get_const(program, program->root);
     if (!root_node) {
         return -1;
+    }
+
+    /* Transaction control statements are handled before anything else. */
+    if (root_node->opcode == sqlexec_begin
+        || root_node->opcode == sqlexec_commit
+        || root_node->opcode == sqlexec_rollback) {
+        return exec_txn(env);
     }
 
     if (is_ddl_root(root_node->opcode)) {
@@ -75,20 +91,23 @@ static int sqlexec_dispatch(sqlexec_env *env)
         return sel_ret;
     }
 
+    if (!is_dml_root(root_node->opcode)) {
+        return -1;
+    }
+
     if (root_node->opcode == sqlexec_append_record) {
-        return exec_insert(env, table_name,
-            root_node->data.assignments);
+        ret = exec_insert(env, table_name, root_node->data.assignments);
+    } else if (root_node->opcode == sqlexec_write_current) {
+        ret = exec_update(env, table_name, program->root);
+    } else {
+        ret = exec_delete(env, table_name, program->root);
     }
 
-    if (root_node->opcode == sqlexec_write_current) {
-        return exec_update(env, table_name, program->root);
-    }
+    /* Record successful DML for potential conflict replay. */
+    if (ret == 0 && env->txn && env->txn->active && env->source_text)
+        txn_record_stmt(env->txn, env->source_text);
 
-    if (root_node->opcode == sqlexec_delete_current) {
-        return exec_delete(env, table_name, program->root);
-    }
-
-    return -1;
+    return ret;
 }
 
 int sqlexec_execute(const char *root, const sqlexec_program *program,
@@ -105,13 +124,16 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
 
     memset(&env, 0, sizeof(env));
     temp_serial = 0;
-    env.root       = root;
-    env.program    = program;
-    env.current_db = current_db;
-    env.io         = io;
-    env.temp       = NULL;
-    env.schema     = NULL;
+    env.root        = root;
+    env.program     = program;
+    env.current_db  = current_db;
+    env.io          = io;
+    env.temp        = NULL;
+    env.schema      = NULL;
     env.temp_serial = &temp_serial;
+    env.txn         = NULL;
+    env.source_text = NULL;
+    env.ctx         = NULL;
 
     ret = sqlexec_dispatch(&env);
 
@@ -134,13 +156,16 @@ int sqlexec_run(sql_context *ctx)
 
     memset(&env, 0, sizeof(env));
     temp_serial = 0;
-    env.root       = ctx->root;
-    env.program    = &ctx->program;
-    env.current_db = ctx->current_db;
-    env.io         = &ctx->io;
-    env.temp       = NULL;
-    env.schema     = ctx->schema;
+    env.root        = ctx->root;
+    env.program     = &ctx->program;
+    env.current_db  = ctx->current_db;
+    env.io          = &ctx->io;
+    env.temp        = NULL;
+    env.schema      = ctx->schema;
     env.temp_serial = &temp_serial;
+    env.txn         = &ctx->txn;
+    env.source_text = ctx->text;
+    env.ctx         = ctx;
 
     ret = sqlexec_dispatch(&env);
 

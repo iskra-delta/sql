@@ -14,6 +14,7 @@
 #include "../common/common.h"
 #include "../catalog/catalog.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define stmt_column_count(stmt) ((stmt)->detail.variant.create_table.column_count)
@@ -987,6 +988,15 @@ static int build_program_from_statement(sqlexec_program *program,
     case sql_statement_delete:
         result = lower_delete(program, statement);
         break;
+    case sql_statement_begin:
+        result = lower_named_root(program, sqlexec_begin, "");
+        break;
+    case sql_statement_commit:
+        result = lower_named_root(program, sqlexec_commit, "");
+        break;
+    case sql_statement_rollback:
+        result = lower_named_root(program, sqlexec_rollback, "");
+        break;
     default:
         result = -1;
         break;
@@ -1060,11 +1070,17 @@ static int validate_view_sql(const char *view_stmt,
 static int expand_and_build_program(sql_statement *statement,
     sqlexec_program *program, const char *root, const char *current_db)
 {
-    sql_statement view_inner;
+    sql_statement *view_inner;
     char original_from_name[sql_name_size];
-    char view_stmt[sql_subquery_size];
+    char *view_stmt;
+    int ret;
 
     if (!program) {
+        return -1;
+    }
+    view_stmt = (char *)malloc(sql_subquery_size);
+    if (!view_stmt) {
+        sqlexec_reset(program);
         return -1;
     }
 
@@ -1077,18 +1093,27 @@ static int expand_and_build_program(sql_statement *statement,
      */
     if (statement->type == sql_statement_select
         && statement_from_is_subquery(statement)) {
-        if (validate_view_sql(statement->subquery_text, &view_inner) != 0) {
+        view_inner = (sql_statement *)malloc(sizeof(sql_statement));
+        if (!view_inner) {
+            free(view_stmt);
+            sqlexec_reset(program);
+            return -1;
+        }
+        if (validate_view_sql(statement->subquery_text, view_inner) != 0) {
+            free(view_inner);
+            free(view_stmt);
             sqlexec_reset(program);
             return -1;
         }
         if ((stmt_join_count(statement) == 0
                 || stmt_from_alias(statement)[0] != '\0')
-            && flatten_simple_select_source(statement, &view_inner,
+            && flatten_simple_select_source(statement, view_inner,
                 stmt_from_alias(statement),
                 stmt_join_count(statement) > 0 ? stmt_from_alias(statement)
-                    : view_inner.name) == 0) {
+                    : view_inner->name) == 0) {
             /* flattened inline subquery */
         }
+        free(view_inner);
     } else if (!statement_from_is_subquery(statement)
         && statement->name[0] != '_') {
         if (statement->type == sql_statement_select) {
@@ -1100,8 +1125,16 @@ static int expand_and_build_program(sql_statement *statement,
             } else if (root && current_db && current_db[0]
                 && find_view(root, current_db, statement->name,
                     NULL, view_stmt) == 0) {
+                view_inner = (sql_statement *)malloc(sizeof(sql_statement));
+                if (!view_inner) {
+                    free(view_stmt);
+                    sqlexec_reset(program);
+                    return -1;
+                }
                 copy_name(original_from_name, statement->name);
-                if (validate_view_sql(view_stmt, &view_inner) != 0) {
+                if (validate_view_sql(view_stmt, view_inner) != 0) {
+                    free(view_inner);
+                    free(view_stmt);
                     sqlexec_reset(program);
                     return -1;
                 }
@@ -1109,50 +1142,70 @@ static int expand_and_build_program(sql_statement *statement,
                     && stmt_from_alias(statement)[0] == '\0') {
                     copy_name(stmt_from_alias(statement), original_from_name);
                 }
-                if (flatten_simple_select_source(statement, &view_inner,
+                if (flatten_simple_select_source(statement, view_inner,
                     stmt_from_alias(statement)[0] != '\0'
                         ? stmt_from_alias(statement) : original_from_name,
                     stmt_join_count(statement) > 0
                         ? stmt_from_alias(statement)
-                        : view_inner.name) != 0) {
+                        : view_inner->name) != 0) {
                     copy_subquery(statement->subquery_text, view_stmt);
                     strcpy(statement->name, "_tmp");
                     stmt_from_is_subquery(statement) = 1;
                 }
+                free(view_inner);
             }
         } else if ((statement->type == sql_statement_update
             || statement->type == sql_statement_delete)
             && root && current_db && current_db[0]
             && find_view(root, current_db, statement->name,
                 NULL, view_stmt) == 0) {
-            if (validate_view_sql(view_stmt, &view_inner) != 0
-                || flatten_view_into_mutation(statement, &view_inner) != 0) {
+            view_inner = (sql_statement *)malloc(sizeof(sql_statement));
+            if (!view_inner) {
+                free(view_stmt);
                 sqlexec_reset(program);
                 return -1;
             }
+            if (validate_view_sql(view_stmt, view_inner) != 0
+                || flatten_view_into_mutation(statement, view_inner) != 0) {
+                free(view_inner);
+                free(view_stmt);
+                sqlexec_reset(program);
+                return -1;
+            }
+            free(view_inner);
         }
     }
 
-    return build_program_from_statement(program, statement);
+    ret = build_program_from_statement(program, statement);
+    free(view_stmt);
+    return ret;
 }
 
 static int parse_and_build_program(const char *text,
     sqlexec_program *program, const char *root,
     const char *current_db, unsigned char select_only)
 {
-    sql_statement statement;
+    sql_statement *statement;
+    int ret;
 
-    if (!program
-        || ((select_only
-                ? sql_parse_select_body(text, &statement)
-                : sql_parse_statement(text, &statement)) != 0)) {
-        if (program) {
-            sqlexec_reset(program);
-        }
+    if (!program) {
         return -1;
     }
-
-    return expand_and_build_program(&statement, program, root, current_db);
+    statement = (sql_statement *)malloc(sizeof(sql_statement));
+    if (!statement) {
+        sqlexec_reset(program);
+        return -1;
+    }
+    if ((select_only
+            ? sql_parse_select_body(text, statement)
+            : sql_parse_statement(text, statement)) != 0) {
+        sqlexec_reset(program);
+        free(statement);
+        return -1;
+    }
+    ret = expand_and_build_program(statement, program, root, current_db);
+    free(statement);
+    return ret;
 }
 
 int sql_parse(const char *text, sqlexec_program *program,

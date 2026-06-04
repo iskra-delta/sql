@@ -13,8 +13,11 @@
 
 #include "sqltypes.h"
 
+/* Every plan is at most a root plus one child (project→scan, write→scan,
+ * delete→scan, or a lone DDL/DML node).  Two nodes is the correct maximum
+ * for the current plan structure. */
 #define sqlexec_max_nodes 2
-#define sqlexec_max_names 64
+#define sqlexec_max_names 24
 
 typedef unsigned char sqlexec_ref;
 
@@ -43,7 +46,10 @@ enum {
     sqlexec_write_current,
     sqlexec_delete_current,
     sqlexec_create_view,
-    sqlexec_drop_view
+    sqlexec_drop_view,
+    sqlexec_begin,
+    sqlexec_commit,
+    sqlexec_rollback
 };
 
 typedef struct sqlexec_span {

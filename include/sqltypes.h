@@ -17,11 +17,11 @@
 #define sql_max_joins (sql_max_sources - 1)
 #define sql_max_groups 8
 #define sql_value_size 34   /* 33 chars + null for one literal value */
-#define sql_where_max_nodes 48
-#define sql_where_max_values 32
+#define sql_where_max_nodes 24
+#define sql_where_max_values 16
 #define sql_where_nil 0xffu
 #define sql_subquery_size 241
-#define sql_max_predicate_subqueries 8
+#define sql_max_predicate_subqueries 2
 #define sql_predicate_subquery_rows 32
 
 typedef struct sql_column {

@@ -295,3 +295,86 @@ unsigned long ndx_to_dbf_index(unsigned long ndx_record)
 {
     return ndx_record > 0 ? ndx_record - 1 : 0;
 }
+
+unsigned short crc16(const char *data, unsigned short length)
+{
+    unsigned short crc = 0xFFFFu;
+    unsigned short i;
+    unsigned char  j;
+
+    for (i = 0; i < length; i++) {
+        crc ^= (unsigned short)((unsigned char)data[i]) << 8;
+        for (j = 0; j < 8; j++) {
+            if (crc & 0x8000u)
+                crc = (unsigned short)((crc << 1) ^ 0x1021u);
+            else
+                crc = (unsigned short)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Intrusive singly-linked list                                         */
+/* ------------------------------------------------------------------ */
+
+int list_match_eq(list_item *item, void *arg)
+{
+    return item == (list_item *)arg;
+}
+
+list_item *list_find(list_item *first, list_item **prev_out,
+    list_match_fn match, void *arg)
+{
+    *prev_out = NULL;
+    while (first && !match(first, arg)) {
+        *prev_out = first;
+        first = first->next;
+    }
+    return first;
+}
+
+list_item *list_insert(list_item **first, list_item *el)
+{
+    el->next = *first;
+    *first = el;
+    return el;
+}
+
+list_item *list_append(list_item **first, list_item *el)
+{
+    list_item *cur;
+
+    el->next = NULL;
+    if (!*first) {
+        *first = el;
+        return el;
+    }
+    cur = *first;
+    while (cur->next)
+        cur = cur->next;
+    cur->next = el;
+    return el;
+}
+
+list_item *list_remove(list_item **first, list_item *el)
+{
+    list_item *prev;
+
+    if (!list_find(*first, &prev, list_match_eq, el))
+        return NULL;
+    if (prev)
+        prev->next = el->next;
+    else
+        *first = el->next;
+    return el;
+}
+
+list_item *list_remove_first(list_item **first)
+{
+    list_item *el = *first;
+
+    if (el)
+        *first = el->next;
+    return el;
+}

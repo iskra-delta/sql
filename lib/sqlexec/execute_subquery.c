@@ -19,6 +19,7 @@
 #include "sqlopt.h"
 #include "../catalog/catalog.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__SDCC)
@@ -82,6 +83,15 @@ static int close_sources(dbf_file *files, unsigned char count)
  * rules used by the SELECT executor. Writes the schema into
  * fields_out/count_out.
  */
+static void free_subq_source_fields(dbf_field **sf)
+{
+    unsigned char i;
+    for (i = 0; i < sql_max_sources; i++) {
+        free(sf[i]);
+        sf[i] = NULL;
+    }
+}
+
 static int determine_inner_schema(const sqlexec_program *program,
     const char *root, const char *db, dbf_field *fields_out,
     unsigned short *count_out)
@@ -91,7 +101,7 @@ static int determine_inner_schema(const sqlexec_program *program,
     const sqlexec_join_def *join_def;
     const row_source *source;
     dbf_file files[sql_max_sources];
-    dbf_field source_fields[sql_max_sources][sql_max_columns];
+    dbf_field *source_fields[sql_max_sources];
     unsigned short source_offsets[sql_max_sources][sql_max_columns];
     row_source sources[sql_max_sources];
     sql_where where;
@@ -104,6 +114,7 @@ static int determine_inner_schema(const sqlexec_program *program,
     unsigned char source_index;
     unsigned char opened_count;
     const char *table_name;
+    int ret;
 
     if (program->root == sqlexec_nil) {
         return -1;
@@ -126,10 +137,16 @@ static int determine_inner_schema(const sqlexec_program *program,
 
     memset(files, 0, sizeof(files));
     memset(sources, 0, sizeof(sources));
+    memset(source_fields, 0, sizeof(source_fields));
     source_count = 1;
     opened_count = 0;
+
+    source_fields[0] = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!source_fields[0])
+        return -1;
     if (open_table_file(root, db, table_name, &files[0], source_fields[0],
         source_offsets[0]) != 0) {
+        free_subq_source_fields(source_fields);
         return -1;
     }
     opened_count = 1;
@@ -144,16 +161,25 @@ static int determine_inner_schema(const sqlexec_program *program,
         join_def = &scan_node->data.join;
         source_count = join_source_count(*join_def);
         if (source_count < 2 || source_count > sql_max_sources) {
+            free_subq_source_fields(source_fields);
             close_sources(files, opened_count);
             return -1;
         }
         sources[0].table_name = join_table_at(program, *join_def, 0);
         sources[0].alias = join_alias_at(program, *join_def, 0);
         for (source_index = 1; source_index < source_count; source_index++) {
+            source_fields[source_index] = (dbf_field *)malloc(
+                sql_max_columns * sizeof(dbf_field));
+            if (!source_fields[source_index]) {
+                free_subq_source_fields(source_fields);
+                close_sources(files, opened_count);
+                return -1;
+            }
             if (open_table_file(root, db,
                 join_table_at(program, *join_def, source_index),
                 &files[source_index], source_fields[source_index],
                 source_offsets[source_index]) != 0) {
+                free_subq_source_fields(source_fields);
                 close_sources(files, opened_count);
                 return -1;
             }
@@ -172,11 +198,13 @@ static int determine_inner_schema(const sqlexec_program *program,
     output_count = exec_project_output_count(&project_node->data.project,
         sources, source_count);
     if (output_count > sql_max_columns) {
+        free_subq_source_fields(source_fields);
         close_sources(files, opened_count);
         return -1;
     }
 
     *count_out = 0;
+    ret = 0;
     for (field_index = 0; field_index < output_count; field_index++) {
         if (project_node->data.project.function_arg_is_star[field_index]) {
             memset(&fields_out[*count_out], 0, sizeof(fields_out[*count_out]));
@@ -187,8 +215,8 @@ static int determine_inner_schema(const sqlexec_program *program,
             if (exec_resolve_project_field(program, &project_node->data.project,
                 sources, source_count, field_index, &source,
                 &source_field_index) != 0) {
-                close_sources(files, opened_count);
-                return -1;
+                ret = -1;
+                break;
             }
             fields_out[*count_out] = source->fields[source_field_index];
         }
@@ -216,8 +244,8 @@ static int determine_inner_schema(const sqlexec_program *program,
                     && source->fields[source_field_index].type != 'N'
                     && project_node->data.project.functions[field_index]
                         != sql_function_count) {
-                    close_sources(files, opened_count);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 fields_out[*count_out].length = 9;
                 fields_out[*count_out].type = 'N';
@@ -227,6 +255,11 @@ static int determine_inner_schema(const sqlexec_program *program,
         (*count_out)++;
     }
 
+    free_subq_source_fields(source_fields);
+    if (ret != 0) {
+        close_sources(files, opened_count);
+        return -1;
+    }
     return close_sources(files, opened_count);
 }
 
@@ -272,52 +305,66 @@ static int prepare_inner_sql_context(const sqlexec_env *parent_env,
 static int exec_sql_to_temp(const sqlexec_env *parent_env,
     const char *sql_text, const char *temp_path, int allow_nested_subquery)
 {
-    sql_context inner;
-    dbf_field fields[sql_max_columns];
+    sql_context *inner;
+    dbf_field *fields;
     unsigned short field_count;
+    sqlexec_env env2;
+    exec_temp_ctx tctx;
+    dbf_file temp_dbf;
+    unsigned short temp_offsets[sql_max_columns];
+    int ret;
+
+    inner = (sql_context *)malloc(sizeof(sql_context));
+    if (!inner)
+        return -1;
+    memset(inner, 0, sizeof(*inner));
+
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields) {
+        free(inner);
+        return -1;
+    }
 
     if (prepare_inner_sql_context(parent_env, sql_text,
-        allow_nested_subquery, &inner) != 0) {
+        allow_nested_subquery, inner) != 0) {
+        free(fields);
+        free(inner);
         return -1;
     }
 
-    if (determine_inner_schema(&inner.program, parent_env->root,
-        parent_env->current_db, fields,
-        &field_count) != 0) {
+    if (determine_inner_schema(&inner->program, parent_env->root,
+        parent_env->current_db, fields, &field_count) != 0) {
+        free(fields);
+        free(inner);
         return -1;
     }
 
-    /* Create the temp DBF. */
-    {
-        sqlexec_env env2;
-        exec_temp_ctx tctx;
-        dbf_file temp_dbf;
-        unsigned short temp_offsets[sql_max_columns];
-        int ret;
-
-        if (dbf_create(&temp_dbf, temp_path, fields, field_count) != 0) {
-            return -1;
-        }
-        build_field_offsets(fields, field_count, temp_offsets);
-
-        tctx.out         = &temp_dbf;
-        tctx.fields      = fields;
-        tctx.offsets     = temp_offsets;
-        tctx.field_count = (unsigned short)field_count;
-
-        memset(&env2, 0, sizeof(env2));
-        env2.root       = parent_env->root;
-        env2.program    = &inner.program;
-        env2.current_db = inner.current_db;
-        env2.io         = &inner.io;
-        env2.temp       = &tctx;
-        env2.collect    = NULL;
-        env2.temp_serial = parent_env->temp_serial;
-
-        ret = sqlexec_execute_env(&env2);
-        dbf_close(&temp_dbf);
-        return ret;
+    if (dbf_create(&temp_dbf, temp_path, fields, field_count) != 0) {
+        free(fields);
+        free(inner);
+        return -1;
     }
+    build_field_offsets(fields, field_count, temp_offsets);
+
+    tctx.out         = &temp_dbf;
+    tctx.fields      = fields;
+    tctx.offsets     = temp_offsets;
+    tctx.field_count = (unsigned short)field_count;
+
+    memset(&env2, 0, sizeof(env2));
+    env2.root        = parent_env->root;
+    env2.program     = &inner->program;
+    env2.current_db  = inner->current_db;
+    env2.io          = &inner->io;
+    env2.temp        = &tctx;
+    env2.collect     = NULL;
+    env2.temp_serial = parent_env->temp_serial;
+
+    ret = sqlexec_execute_env(&env2);
+    dbf_close(&temp_dbf);
+    free(fields);
+    free(inner);
+    return ret;
 }
 
 static int note_subquery_uses(const sql_where *where,
@@ -383,20 +430,27 @@ int load_predicate_subqueries(const sqlexec_env *env,
     sql_predicate_subquery_cache *cache)
 {
     unsigned char uses[sql_max_predicate_subqueries];
-    sql_context inner;
+    sql_context *inner;
     sqlexec_env inner_env;
     exec_collect_ctx collect;
     unsigned short index;
 
+    inner = (sql_context *)malloc(sizeof(sql_context));
+    if (!inner)
+        return -1;
+
     memset(cache, 0, sizeof(*cache));
     cache->count = env->program->predicate_subquery_count;
     if (collect_predicate_subquery_uses(env->program, uses) != 0) {
+        free(inner);
         return -1;
     }
     for (index = 0; index < env->program->predicate_subquery_count; index++) {
+        memset(inner, 0, sizeof(*inner));
         if (uses[index] == 0
             || prepare_inner_sql_context(env,
-                env->program->predicate_subqueries[index], 0, &inner) != 0) {
+                env->program->predicate_subqueries[index], 0, inner) != 0) {
+            free(inner);
             return -1;
         }
 
@@ -407,17 +461,19 @@ int load_predicate_subqueries(const sqlexec_env *env,
 
         memset(&inner_env, 0, sizeof(inner_env));
         inner_env.root = env->root;
-        inner_env.program = &inner.program;
-        inner_env.current_db = inner.current_db;
-        inner_env.io = &inner.io;
+        inner_env.program = &inner->program;
+        inner_env.current_db = inner->current_db;
+        inner_env.io = &inner->io;
         inner_env.temp = NULL;
         inner_env.collect = &collect;
         inner_env.temp_serial = env->temp_serial;
 
         if (sqlexec_execute_env(&inner_env) != 0) {
+            free(inner);
             return -1;
         }
     }
+    free(inner);
     return 0;
 }
 

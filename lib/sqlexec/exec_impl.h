@@ -83,6 +83,9 @@ typedef struct exec_project_binding {
     signed char having_value_output[sql_where_max_values];
 } exec_project_binding;
 
+/* Pull in sql_context (and with it sql_txn) for the env fields below. */
+#include "sqlctx.h"
+
 typedef struct sqlexec_env {
     const char *root;
     const sqlexec_program *program;
@@ -96,6 +99,12 @@ typedef struct sqlexec_env {
     meta_cache *schema;
     /* Shared counter for allocating unique temp files in nested work. */
     unsigned short *temp_serial;
+    /* Transaction state — NULL when called outside sql_context. */
+    struct sql_txn *txn;
+    /* Original SQL text for statement recording inside a transaction. */
+    const char *source_text;
+    /* Full context pointer for COMMIT conflict replay. */
+    struct sql_context *ctx;
 } sqlexec_env;
 
 /* ------------------------------------------------------------------ */

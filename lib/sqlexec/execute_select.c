@@ -7,7 +7,9 @@
  */
 
 #include "exec_impl.h"
+#include "../tran/tran.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -677,8 +679,8 @@ static int scan_group_rows(const sqlexec_env *env,
     const exec_project_binding *binding,
     const sql_where *where, const where_binding *where_binding,
     dbf_file *files, row_source *sources, unsigned char source_count,
-    char records[sql_max_sources][table_record_size], unsigned char depth,
-    select_group groups[sql_max_groups],
+    char **records, unsigned char depth,
+    select_group *groups,
     const where_term *where_terms, unsigned char where_term_count,
     const sql_predicate_subquery_cache *subqueries)
 {
@@ -686,13 +688,14 @@ static int scan_group_rows(const sqlexec_env *env,
     int state;
 
     for (index = 0; index < files[depth].record_count; index++) {
+        int ov;
         state = dbf_read(&files[depth], index, records[depth]);
-        if (state < 0) {
-            return -1;
-        }
-        if (state == 1) {
-            continue;
-        }
+        if (state < 0) return -1;
+        if (state == 1) continue;
+        ov = txn_overlay_record(env, sources[depth].table_name, index,
+            records[depth], files[depth].record_length);
+        if (ov < 0) return -1;
+        if (ov == 1) continue;
         if (!where_terms_match_depth(env, where, sources, where_binding,
             source_count, where_terms, where_term_count, depth,
             subqueries)) {
@@ -718,21 +721,32 @@ static int emit_grouped_rows(const sqlexec_env *env,
     const exec_project_binding *binding, const sqlexec_project_def *project,
     const sql_where *where, const where_binding *where_binding,
     dbf_file *files, row_source *sources, unsigned char source_count,
-    char records[sql_max_sources][table_record_size],
+    char **records,
     const where_term *where_terms, unsigned char where_term_count,
     unsigned short *row_count,
     const sql_predicate_subquery_cache *subqueries)
 {
-    select_group groups[sql_max_groups];
-    select_distinct_row seen_rows[sql_max_groups];
+    select_group *groups;
+    select_distinct_row *seen_rows;
     char output_values[sql_max_columns][sql_value_size];
     unsigned short group_index;
+    int distinct_state;
 
-    memset(groups, 0, sizeof(groups));
-    memset(seen_rows, 0, sizeof(seen_rows));
+    groups = (select_group *)calloc(sql_max_groups, sizeof(select_group));
+    if (!groups)
+        return -1;
+    seen_rows = (select_distinct_row *)calloc(
+        sql_max_groups, sizeof(select_distinct_row));
+    if (!seen_rows) {
+        free(groups);
+        return -1;
+    }
+
     if (scan_group_rows(env, binding, where, where_binding, files,
         sources, source_count, records, 0, groups, where_terms,
         where_term_count, subqueries) != 0) {
+        free(seen_rows);
+        free(groups);
         return -1;
     }
     if (!groups[0].used && project->has_aggregate
@@ -747,6 +761,8 @@ static int emit_grouped_rows(const sqlexec_env *env,
         }
         if (build_group_output_values(binding, &groups[group_index],
             output_values) != 0) {
+            free(seen_rows);
+            free(groups);
             return -1;
         }
         if (!having_matches_output(env, binding, output_values,
@@ -754,9 +770,11 @@ static int emit_grouped_rows(const sqlexec_env *env,
             continue;
         }
         if (project->distinct) {
-            int distinct_state = distinct_row_is_new(seen_rows, output_values,
+            distinct_state = distinct_row_is_new(seen_rows, output_values,
                 binding->output_count);
             if (distinct_state < 0) {
+                free(seen_rows);
+                free(groups);
                 return -1;
             }
             if (!distinct_state) {
@@ -765,11 +783,15 @@ static int emit_grouped_rows(const sqlexec_env *env,
         }
         if (emit_output_values(env, binding->output_types, output_values,
             binding->output_count) != 0) {
+            free(seen_rows);
+            free(groups);
             return -1;
         }
         (*row_count)++;
     }
 
+    free(seen_rows);
+    free(groups);
     return 0;
 }
 
@@ -813,8 +835,8 @@ static int scan_distinct_rows(const sqlexec_env *env,
     const exec_project_binding *binding, const sql_where *where,
     const where_binding *where_binding,
     dbf_file *files, row_source *sources, unsigned char source_count,
-    char records[sql_max_sources][table_record_size], unsigned char depth,
-    select_distinct_row seen_rows[sql_max_groups], unsigned short *row_count,
+    char **records, unsigned char depth,
+    select_distinct_row *seen_rows, unsigned short *row_count,
     const where_term *where_terms, unsigned char where_term_count,
     const sql_predicate_subquery_cache *subqueries)
 {
@@ -822,13 +844,14 @@ static int scan_distinct_rows(const sqlexec_env *env,
     int state;
 
     for (index = 0; index < files[depth].record_count; index++) {
+        int ov;
         state = dbf_read(&files[depth], index, records[depth]);
-        if (state < 0) {
-            return -1;
-        }
-        if (state == 1) {
-            continue;
-        }
+        if (state < 0) return -1;
+        if (state == 1) continue;
+        ov = txn_overlay_record(env, sources[depth].table_name, index,
+            records[depth], files[depth].record_length);
+        if (ov < 0) return -1;
+        if (ov == 1) continue;
         if (!where_terms_match_depth(env, where, sources, where_binding,
             source_count, where_terms, where_term_count, depth,
             subqueries)) {
@@ -854,18 +877,24 @@ static int emit_distinct_rows(const sqlexec_env *env,
     const exec_project_binding *binding, const sql_where *where,
     const where_binding *where_binding,
     dbf_file *files, row_source *sources, unsigned char source_count,
-    char records[sql_max_sources][table_record_size],
+    char **records,
     const where_term *where_terms, unsigned char where_term_count,
     unsigned short *row_count,
     const sql_predicate_subquery_cache *subqueries)
 {
-    select_distinct_row seen_rows[sql_max_groups];
+    select_distinct_row *seen_rows;
+    int ret;
 
-    memset(seen_rows, 0, sizeof(seen_rows));
+    seen_rows = (select_distinct_row *)calloc(
+        sql_max_groups, sizeof(select_distinct_row));
+    if (!seen_rows)
+        return -1;
     *row_count = 0;
-    return scan_distinct_rows(env, binding, where, where_binding, files,
+    ret = scan_distinct_rows(env, binding, where, where_binding, files,
         sources, source_count, records, 0, seen_rows, row_count,
         where_terms, where_term_count, subqueries);
+    free(seen_rows);
+    return ret;
 }
 
 static int emit_matching_row(const sqlexec_env *env,
@@ -894,7 +923,7 @@ static int scan_join_rows(const sqlexec_env *env,
     const sql_where *where, const where_binding *where_binding,
     dbf_file *files,
     row_source *sources, unsigned char source_count,
-    char records[sql_max_sources][table_record_size], unsigned char depth,
+    char **records, unsigned char depth,
     unsigned short *row_count,
     const where_term *where_terms, unsigned char where_term_count,
     const sql_predicate_subquery_cache *subqueries)
@@ -903,13 +932,14 @@ static int scan_join_rows(const sqlexec_env *env,
     int state;
 
     for (index = 0; index < files[depth].record_count; index++) {
+        int ov;
         state = dbf_read(&files[depth], index, records[depth]);
-        if (state < 0) {
-            return -1;
-        }
-        if (state == 1) {
-            continue;
-        }
+        if (state < 0) return -1;
+        if (state == 1) continue;
+        ov = txn_overlay_record(env, sources[depth].table_name, index,
+            records[depth], files[depth].record_length);
+        if (ov < 0) return -1;
+        if (ov == 1) continue;
         if (!where_terms_match_depth(env, where, sources, where_binding,
             source_count, where_terms, where_term_count, depth,
             subqueries)) {
@@ -943,6 +973,58 @@ static int close_sources(dbf_file *files, unsigned char count)
     return 0;
 }
 
+static int close_and_free_sources(dbf_file *files, char **records,
+    dbf_field **fields, unsigned char count)
+{
+    unsigned char index;
+
+    for (index = 0; index < count; index++) {
+        free(records[index]);
+        free(fields[index]);
+    }
+    return close_sources(files, count);
+}
+
+/* ------------------------------------------------------------------ */
+/* Transaction INSERT visibility callback                               */
+/* ------------------------------------------------------------------ */
+
+typedef struct sel_insert_ctx {
+    const sqlexec_env     *env;
+    const exec_project_binding *binding;
+    const sql_where       *where;
+    const where_binding   *where_binding;
+    const row_source      *source;
+    unsigned short        *row_count;
+    const sql_predicate_subquery_cache *subqueries;
+    unsigned short         record_length;
+    int                    count_only;
+} sel_insert_ctx;
+
+static int sel_insert_cb(unsigned long virtual_recno,
+    const char *record, unsigned short record_length, void *cb_ctx)
+{
+    sel_insert_ctx *c = (sel_insert_ctx *)cb_ctx;
+    row_source vsrc;
+    (void)virtual_recno;
+    (void)record_length;
+
+    /* Temporarily point the source record at the virtual row. */
+    memcpy((void *)&vsrc, c->source, sizeof(row_source));
+    vsrc.record = record;
+
+    if (!where_matches_bound_n(c->env->program, c->where,
+        c->where_binding, &vsrc, c->subqueries))
+        return 0;
+
+    if (!c->count_only) {
+        if (emit_projected_row(c->env, c->binding, &vsrc) != 0)
+            return -1;
+    }
+    (*c->row_count)++;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* SELECT executor                                                      */
 /* ------------------------------------------------------------------ */
@@ -955,14 +1037,14 @@ int exec_select(sqlexec_env *env, const char *table_name,
     const sqlexec_node *scan_node;
     const sqlexec_join_def *join_def;
     dbf_file files[sql_max_sources];
-    dbf_field source_fields[sql_max_sources][sql_max_columns];
+    dbf_field *source_fields[sql_max_sources];
     unsigned short source_offsets[sql_max_sources][sql_max_columns];
-    char source_records[sql_max_sources][table_record_size];
+    char *source_records[sql_max_sources];
     sql_where where;
     row_source sources[sql_max_sources];
-    where_binding where_binding_storage;
+    where_binding *wb_store;
     const where_binding *where_binding;
-    where_term where_terms[sql_where_max_nodes];
+    where_term *where_terms;
     unsigned short row_count;
     sqlexec_ref scan_ref;
     sqlexec_ref child_ref;
@@ -970,9 +1052,9 @@ int exec_select(sqlexec_env *env, const char *table_name,
     unsigned char source_index;
     unsigned char opened_source_count;
     unsigned char where_term_count;
-    exec_project_binding binding;
+    exec_project_binding *binding;
     exec_index_scan_ctx scan_ctx;
-    sql_predicate_subquery_cache predicate_subqueries;
+    sql_predicate_subquery_cache *psc;
     int count_only;
     int grouped_select;
     int special_projection;
@@ -983,18 +1065,41 @@ int exec_select(sqlexec_env *env, const char *table_name,
     }
     memset(files, 0, sizeof(files));
     memset(sources, 0, sizeof(sources));
-    memset(where_terms, 0, sizeof(where_terms));
-    memset(&predicate_subqueries, 0, sizeof(predicate_subqueries));
+    memset(source_records, 0, sizeof(source_records));
+    memset(source_fields, 0, sizeof(source_fields));
+    wb_store = NULL;
+    where_binding = NULL;
+    where_terms = NULL;
+    binding = NULL;
+    psc = NULL;
     source_count = 1;
     opened_source_count = 0;
     where_term_count = 0;
-    where_binding = NULL;
 
+    source_fields[0] = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!source_fields[0]) {
+        return -1;
+    }
     if (open_table_file(env->root, env->current_db, table_name, &files[0],
         source_fields[0], source_offsets[0]) != 0) {
+        free(source_fields[0]);
+        source_fields[0] = NULL;
+        return -1;
+    }
+    source_records[0] = (char *)malloc(files[0].record_length);
+    if (!source_records[0]) {
+        close_sources(files, 1);
+        free(source_fields[0]);
         return -1;
     }
     opened_source_count = 1;
+
+/* Free all heap-allocated select buffers and close sources. */
+#define SEL_FAIL(n) do { \
+    free(where_terms); free(binding); free(wb_store); free(psc); \
+    close_and_free_sources(files, source_records, source_fields, (n)); \
+    return -1; \
+} while (0)
 
     count_only = plan_node->opcode != sqlexec_project;
     if (!count_only) {
@@ -1002,22 +1107,19 @@ int exec_select(sqlexec_env *env, const char *table_name,
         child_ref = child_at(env->program, plan_ref, 0);
         if (resolve_scan_node(env->program, child_ref,
             &where, &scan_ref) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+            SEL_FAIL(opened_source_count);
         }
     } else {
         if (resolve_scan_node(env->program, plan_ref, &where,
             &scan_ref) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+            SEL_FAIL(opened_source_count);
         }
         project_node = NULL;
     }
 
     scan_node = sqlexec_get_const(env->program, scan_ref);
     if (!scan_node || scan_ref == sqlexec_nil) {
-        close_sources(files, opened_source_count);
-        return -1;
+        SEL_FAIL(opened_source_count);
     }
 
     sources[0].table_name = table_name;
@@ -1031,20 +1133,29 @@ int exec_select(sqlexec_env *env, const char *table_name,
         join_def = &scan_node->data.join;
         source_count = join_source_count(*join_def);
         if (source_count < 2 || source_count > sql_max_sources) {
-            close_sources(files, opened_source_count);
-            return -1;
+            SEL_FAIL(opened_source_count);
         }
         sources[0].table_name = join_table_at(env->program, *join_def, 0);
         sources[0].alias = join_alias_at(env->program, *join_def, 0);
         for (source_index = 1; source_index < source_count; source_index++) {
+            source_fields[source_index] = (dbf_field *)malloc(
+                sql_max_columns * sizeof(dbf_field));
+            if (!source_fields[source_index]) {
+                SEL_FAIL(opened_source_count);
+            }
             if (open_table_file(env->root, env->current_db,
                 join_table_at(env->program, *join_def, source_index),
                 &files[source_index], source_fields[source_index],
                 source_offsets[source_index]) != 0) {
-                close_sources(files, opened_source_count);
-                return -1;
+                /* source_fields[source_index] freed by SEL_FAIL */
+                SEL_FAIL(opened_source_count);
             }
             opened_source_count++;
+            source_records[source_index] = (char *)malloc(
+                files[source_index].record_length);
+            if (!source_records[source_index]) {
+                SEL_FAIL(opened_source_count);
+            }
             sources[source_index].table_name = join_table_at(env->program,
                 *join_def, source_index);
             sources[source_index].alias = join_alias_at(env->program,
@@ -1057,7 +1168,8 @@ int exec_select(sqlexec_env *env, const char *table_name,
     }
 
     if (where_is_constant_false(&where, env->program->where_nodes)) {
-        if (close_sources(files, opened_source_count) != 0) {
+        if (close_and_free_sources(files, source_records, source_fields,
+            opened_source_count) != 0) {
             return -1;
         }
         sel_write_uint(env, 0);
@@ -1068,30 +1180,46 @@ int exec_select(sqlexec_env *env, const char *table_name,
         return 0;
     }
 
-    if (env->program->predicate_subquery_count > 0
-        && load_predicate_subqueries(env, &predicate_subqueries) != 0) {
-        close_sources(files, opened_source_count);
-        return -1;
+    if (env->program->predicate_subquery_count > 0) {
+        psc = (sql_predicate_subquery_cache *)malloc(
+            sizeof(sql_predicate_subquery_cache));
+        if (!psc) {
+            SEL_FAIL(opened_source_count);
+        }
+        memset(psc, 0, sizeof(*psc));
+        if (load_predicate_subqueries(env, psc) != 0) {
+            SEL_FAIL(opened_source_count);
+        }
     }
 
-    if (!count_only
-        && exec_bind_project(env->program, &project_node->data.project,
-            sources, source_count, &binding) != 0) {
-        close_sources(files, opened_source_count);
-        return -1;
+    if (!count_only) {
+        binding = (exec_project_binding *)malloc(sizeof(exec_project_binding));
+        if (!binding) {
+            SEL_FAIL(opened_source_count);
+        }
+        if (exec_bind_project(env->program, &project_node->data.project,
+            sources, source_count, binding) != 0) {
+            SEL_FAIL(opened_source_count);
+        }
     }
     if (!where_can_use_program_binding(env->program, &where)) {
-        if (where_bind_n(env->program, &where, sources, source_count,
-            &where_binding_storage) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+        wb_store = malloc(sizeof(*wb_store));
+        if (!wb_store) {
+            SEL_FAIL(opened_source_count);
         }
-        where_binding = &where_binding_storage;
+        if (where_bind_n(env->program, &where, sources, source_count,
+            wb_store) != 0) {
+            SEL_FAIL(opened_source_count);
+        }
+        where_binding = wb_store;
+    }
+    where_terms = (where_term *)calloc(sql_where_max_nodes, sizeof(where_term));
+    if (!where_terms) {
+        SEL_FAIL(opened_source_count);
     }
     if (where_split_conjuncts_bound(env->program, &where, where_binding,
         where_terms, &where_term_count) != 0) {
-        close_sources(files, opened_source_count);
-        return -1;
+        SEL_FAIL(opened_source_count);
     }
     grouped_select = !count_only
         && project_requires_grouping(&project_node->data.project);
@@ -1101,19 +1229,17 @@ int exec_select(sqlexec_env *env, const char *table_name,
 
     row_count = 0;
     if (grouped_select) {
-        if (emit_grouped_rows(env, &binding, &project_node->data.project,
+        if (emit_grouped_rows(env, binding, &project_node->data.project,
             &where, where_binding, files, sources, source_count,
             source_records, where_terms, where_term_count, &row_count,
-            &predicate_subqueries) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+            psc) != 0) {
+            SEL_FAIL(opened_source_count);
         }
     } else if (!count_only && project_node->data.project.distinct) {
-        if (emit_distinct_rows(env, &binding, &where, where_binding, files,
+        if (emit_distinct_rows(env, binding, &where, where_binding, files,
             sources, source_count, source_records, where_terms,
-            where_term_count, &row_count, &predicate_subqueries) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+            where_term_count, &row_count, psc) != 0) {
+            SEL_FAIL(opened_source_count);
         }
     } else if (source_count == 1 && scan_uses_index(scan_node)
         && !special_projection) {
@@ -1128,22 +1254,42 @@ int exec_select(sqlexec_env *env, const char *table_name,
         scan_ctx.where = &where;
         scan_ctx.where_binding = where_binding;
         scan_ctx.action = exec_scan_select;
-        scan_ctx.binding = &binding;
+        scan_ctx.binding = binding;
         scan_ctx.count_only = count_only;
         scan_ctx.row_count = &row_count;
-        scan_ctx.subqueries = &predicate_subqueries;
+        scan_ctx.subqueries = psc;
         if (exec_run_index_scan(env, scan_node, &scan_ctx) != 0) {
-            close_sources(files, opened_source_count);
-            return -1;
+            SEL_FAIL(opened_source_count);
         }
-    } else if (scan_join_rows(env, count_only ? NULL : &binding,
+    } else if (scan_join_rows(env, binding,
         count_only, &where, where_binding, files, sources,
         source_count, source_records, 0, &row_count, where_terms,
-        where_term_count, &predicate_subqueries) != 0) {
-        close_sources(files, opened_source_count);
-        return -1;
+        where_term_count, psc) != 0) {
+        SEL_FAIL(opened_source_count);
     }
-    if (close_sources(files, opened_source_count) != 0) {
+    /* Yield pending INSERT rows for single-source non-grouped queries. */
+    if (source_count == 1 && !grouped_select
+        && env->txn && env->txn->active) {
+        sel_insert_ctx ins_ctx;
+        ins_ctx.env           = env;
+        ins_ctx.binding       = binding;
+        ins_ctx.where         = &where;
+        ins_ctx.where_binding = where_binding;
+        ins_ctx.source        = &sources[0];
+        ins_ctx.row_count     = &row_count;
+        ins_ctx.subqueries    = psc;
+        ins_ctx.record_length = files[0].record_length;
+        ins_ctx.count_only    = count_only;
+        if (txn_scan_inserts(env, table_name, sel_insert_cb, &ins_ctx) != 0) {
+            SEL_FAIL(opened_source_count);
+        }
+    }
+    free(where_terms);
+    free(binding);
+    free(wb_store);
+    free(psc);
+    if (close_and_free_sources(files, source_records, source_fields,
+        opened_source_count) != 0) {
         return -1;
     }
 
@@ -1157,3 +1303,4 @@ int exec_select(sqlexec_env *env, const char *table_name,
     sel_write_nl(env);
     return 0;
 }
+#undef SEL_FAIL

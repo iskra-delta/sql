@@ -10,6 +10,7 @@
 
 #include "catalog.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__SDCC)
@@ -600,31 +601,39 @@ int build_index_from_catalog_entry(const char *root, const char *db_name,
     const char *field_list, unsigned char unique)
 {
     dbf_file table;
-    dbf_field fields[sql_max_columns];
+    dbf_field *fields;
     unsigned short offsets[sql_max_columns];
     unsigned short key_fields[sql_max_columns];
     unsigned short key_count;
     ndx_file index;
     char index_path[path_buffer_size];
 
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields)
+        return -1;
     if (open_table_file(root, db_name, table_name, &table, fields,
         offsets) != 0) {
+        free(fields);
         return -1;
     }
     if (parse_index_field_list(field_list, fields, table.field_count,
         key_fields, &key_count) != 0) {
+        free(fields);
         dbf_close(&table);
         return -1;
     }
     if (build_index_path(root, db_name, index_name, index_path) != 0) {
+        free(fields);
         dbf_close(&table);
         return -1;
     }
     if (ndx_create(&index, index_path, &table, fields, table.field_count,
         key_fields, key_count, unique) != 0) {
+        free(fields);
         dbf_close(&table);
         return -1;
     }
+    free(fields);
     if (ndx_close(&index) != 0) {
         dbf_close(&table);
         return -1;

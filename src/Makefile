@@ -13,6 +13,7 @@ libndx_dir ?= ../lib/ndx
 libsql_dir ?= ../lib/sql
 libsqlexec_dir ?= ../lib/sqlexec
 libsqlopt_dir ?= ../lib/sqlopt
+libtran_dir   ?= ../lib/tran
 
 app_sources := main.c platform.c
 app_objects := $(patsubst %.c,$(build_dir)/src_%.o,$(app_sources))
@@ -25,7 +26,8 @@ libdbf_archive := $(build_dir)/libdbf.a
 libndx_archive := $(build_dir)/libndx.a
 libsql_archive := $(build_dir)/libsql.a
 libsqlexec_archive := $(build_dir)/libsqlexec.a
-libsqlopt_archive := $(build_dir)/libsqlopt.a
+libsqlopt_archive  := $(build_dir)/libsqlopt.a
+libtran_archive    := $(build_dir)/libtran.a
 
 cflags_common := -std=c11 -I$(include_dir) -Wall -Wextra -pedantic
 cflags_debug := -g -fsanitize=address,undefined
@@ -36,7 +38,7 @@ target := $(bin_dir)/$(project_name)
 
 .PHONY: all debug release run clean sdcc_check \
 	force_libcommon force_libcatalog force_libdbf force_libndx \
-	force_libsql force_libsqlexec force_libsqlopt
+	force_libsql force_libsqlexec force_libsqlopt force_libtran
 
 all: debug
 
@@ -53,9 +55,10 @@ run: debug
 
 $(target): $(objects) $(libcommon_archive) $(libcatalog_archive) \
 		$(libdbf_archive) $(libndx_archive) $(libsql_archive) \
-		$(libsqlexec_archive) $(libsqlopt_archive) | $(bin_dir)
+		$(libsqlexec_archive) $(libsqlopt_archive) $(libtran_archive) | $(bin_dir)
 	$(cc) $(objects) \
-		$(libsql_archive) $(libsqlexec_archive) $(libsqlopt_archive) \
+		$(libsql_archive) $(libsqlexec_archive) $(libtran_archive) \
+		$(libsqlopt_archive) \
 		$(libcatalog_archive) $(libcommon_archive) \
 		$(libndx_archive) $(libdbf_archive) \
 		$(ldflags) -o $@
@@ -104,6 +107,14 @@ $(libsqlopt_archive): force_libsqlopt
 	$(MAKE) -C $(libsqlopt_dir) debug cc=$(cc) sdcc=$(sdcc) \
 		include_dir=$(abspath $(include_dir)) \
 		build_dir=$(abspath $(build_dir))
+
+$(libtran_archive): force_libtran
+	$(MAKE) -C $(libtran_dir) debug cc=$(cc) sdcc=$(sdcc) \
+		include_dir=$(abspath $(include_dir)) \
+		build_dir=$(abspath $(build_dir)) \
+		common_dir=$(abspath $(libcommon_dir)) \
+		catalog_dir=$(abspath $(libcatalog_dir)) \
+		sqlexec_dir=$(abspath $(libsqlexec_dir))
 
 sdcc_check: $(app_sources) $(headers) | $(build_dir)
 	$(sdcc) $(sdccflags) -I$(include_dir) -c main.c \

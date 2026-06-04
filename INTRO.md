@@ -66,6 +66,7 @@ Supported column types:
 | Type | Description |
 |---|---|
 | `CHAR(n)` | Fixed-width text, up to *n* characters |
+| `CHARACTER(n)` | Alias for `CHAR(n)` |
 | `NUMERIC(n[,d])` | Number stored in *n* character positions, *d* decimals |
 | `DATE` | Date in `YYYYMMDD` format |
 | `LOGICAL` | Single character flag (`T` or `F`) |
@@ -92,6 +93,13 @@ demo> INSERT INTO people VALUES ('carol', 30, T);
 inserted 1
 ```
 
+Insert with named columns (other columns are left blank):
+
+```
+demo> INSERT INTO people (name, age) VALUES ('dave', 28);
+inserted 1
+```
+
 Select all columns:
 
 ```
@@ -99,7 +107,8 @@ demo> SELECT * FROM people;
 alice | 30 | T
 bob | 25 | F
 carol | 30 | T
-3 rows
+dave | 28 |
+4 rows
 ```
 
 Select specific columns with a filter:
@@ -111,13 +120,11 @@ carol | 30
 2 rows
 ```
 
-Count rows (`COUNT(1)` is equivalent to `COUNT(*)`):
+Count rows:
 
 ```
 demo> SELECT COUNT(*) FROM people WHERE active = T;
 2
-demo> SELECT COUNT(1) FROM people;
-3
 ```
 
 Update matching rows:
@@ -138,13 +145,17 @@ demo> DELETE FROM people WHERE active = F;
 
 ## WHERE Expressions
 
-The WHERE clause supports `AND`, `OR`, `IN (...)`, parentheses, and
-the operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`.
+The WHERE clause supports `AND`, `OR`, `NOT`, parentheses, `LIKE`,
+`BETWEEN`, `IS NULL`, `IS NOT NULL`, `IN (...)`, and the comparison
+operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`.
 
 ```sql
 SELECT * FROM people WHERE age > 25 AND active = T;
 SELECT * FROM people WHERE city = 'LON' OR city = 'NYC';
 SELECT * FROM people WHERE age IN (25, 30, 35);
+SELECT * FROM people WHERE age BETWEEN 20 AND 35;
+SELECT * FROM people WHERE name LIKE 'a%';
+SELECT * FROM people WHERE name IS NOT NULL;
 SELECT * FROM people WHERE (age > 20 AND active = T) OR name = 'bob';
 ```
 
@@ -152,7 +163,7 @@ SELECT * FROM people WHERE (age > 20 AND active = T) OR name = 'bob';
 
 ## Joins
 
-One inner join per SELECT:
+Up to 3 JOIN clauses or comma-separated sources per SELECT:
 
 ```
 demo> CREATE TABLE cities (code CHAR(3), name CHAR(16));
@@ -179,6 +190,32 @@ WHERE c.code = 'LON';
 
 ---
 
+## Aggregates and GROUP BY
+
+```
+demo> SELECT city, COUNT(*) FROM employees GROUP BY city;
+LON | 1
+NYC | 1
+2 rows
+
+demo> SELECT city, MAX(age), MIN(age) FROM employees GROUP BY city
+...>  HAVING MAX(age) > 20;
+LON | 30 | 30
+NYC | 25 | 25
+2 rows
+```
+
+Supported aggregate functions: `COUNT(*)`, `COUNT(col)`, `MIN(col)`,
+`MAX(col)`, `SUM(col)`, `AVG(col)`.
+
+`SELECT DISTINCT` is also supported:
+
+```sql
+SELECT DISTINCT city FROM employees;
+```
+
+---
+
 ## Indexes
 
 Create an index to speed up equality and range queries:
@@ -188,11 +225,11 @@ demo> CREATE INDEX age_idx ON people (age);
 created index age_idx
 ```
 
-Create a composite character index:
+Create a unique index:
 
 ```
-demo> CREATE UNIQUE INDEX name_city ON people (name, city);
-created index name_city
+demo> CREATE UNIQUE INDEX name_idx ON people (name);
+created index name_idx
 ```
 
 The optimizer automatically uses registered indexes for single-field
@@ -253,6 +290,44 @@ demo> SELECT name FROM (SELECT name, age FROM people WHERE active = T) AS p
 alice
 1 row
 ```
+
+Use a subquery in a WHERE condition:
+
+```sql
+SELECT name FROM people
+WHERE age IN (SELECT age FROM employees WHERE city = 'LON');
+```
+
+---
+
+## Transactions
+
+Group multiple statements into an atomic unit:
+
+```
+demo> BEGIN;
+demo> INSERT INTO people VALUES ('eve', 22, T);
+inserted 1
+demo> UPDATE people SET age = 32 WHERE name = 'alice';
+1 updated
+demo> COMMIT;
+```
+
+Roll back all changes since BEGIN:
+
+```
+demo> BEGIN;
+demo> DELETE FROM people WHERE active = F;
+1 deleted
+demo> ROLLBACK;
+```
+
+While a transaction is open, SELECT shows the pending changes as if
+they were already committed.  COMMIT verifies that every updated or
+deleted row is unchanged since the transaction started; if another
+writer modified a row the commit fails — issue ROLLBACK and retry.
+
+DDL (CREATE, DROP, USE) is not allowed inside an open transaction.
 
 ---
 
@@ -327,8 +402,11 @@ demo | ./db/1 | 1
 | Databases per root | 15 |
 | Columns per table | 16 |
 | Column / identifier length | 16 characters |
-| String value length | 32 characters |
-| WHERE conditions (nodes) | 16 |
-| One JOIN per SELECT | — |
-| One WHERE per statement | — |
-| No `ORDER BY`, `GROUP BY`, aggregates beyond `COUNT(*)` | — |
+| String value length | 33 characters |
+| Row sources per SELECT | 4 (1 base + 3 JOINs) |
+| WHERE / HAVING nodes | 24 |
+| WHERE / HAVING values | 16 |
+| Distinct / grouped result rows per SELECT | 8 |
+| Predicate subqueries per statement | 2 |
+| Subquery nesting depth | 1 |
+| No `ORDER BY` | — |

@@ -83,7 +83,7 @@ meta_cache *meta_cache_load(const char *root, const char *db_name)
     meta_table *tail;
 
 #if !defined(__SDCC)
-    dbf_field fields[sql_max_columns];
+    dbf_field *fields;
     unsigned short field_count;
     DIR *dir;
     struct dirent *ent;
@@ -106,8 +106,14 @@ meta_cache *meta_cache_load(const char *root, const char *db_name)
     tail = NULL;
 
 #if !defined(__SDCC)
+    fields = (dbf_field *)malloc(sql_max_columns * sizeof(dbf_field));
+    if (!fields) {
+        free(cache);
+        return NULL;
+    }
     dir = opendir(db_path);
     if (!dir) {
+        free(fields);
         free(cache);
         return NULL;
     }
@@ -138,6 +144,7 @@ meta_cache *meta_cache_load(const char *root, const char *db_name)
             (unsigned char)field_count);
         if (!node) {
             closedir(dir);
+            free(fields);
             meta_cache_free(cache);
             return NULL;
         }
@@ -152,6 +159,7 @@ meta_cache *meta_cache_load(const char *root, const char *db_name)
     }
 
     closedir(dir);
+    free(fields);
 #endif
 
     return cache;
