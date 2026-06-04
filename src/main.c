@@ -15,7 +15,7 @@
 #include <stddef.h>   /* NULL */
 
 /* metacache.h for meta_cache_free on clean exit. */
-#include "../lib/shared/metacache.h"
+#include "../lib/sqlexec/metacache.h"
 
 #define sql_buffer_size 256
 

@@ -11,7 +11,6 @@
 
 #include "exec_impl.h"
 #include "sqlctx.h"
-#include "../shared/metacache.h"
 
 #include <string.h>
 
@@ -19,34 +18,32 @@ static int is_ddl_root(sqlexec_opcode opcode)
 {
     return opcode == sqlexec_create_database
         || opcode == sqlexec_use_database
+        || opcode == sqlexec_drop_database
         || opcode == sqlexec_create_table
+        || opcode == sqlexec_drop_table
+        || opcode == sqlexec_create_index
         || opcode == sqlexec_create_view
         || opcode == sqlexec_drop_view;
 }
 
-static int is_ddl_sequence_first(sqlexec_opcode opcode)
+static int is_select_head(sqlexec_opcode opcode)
 {
-    return opcode == sqlexec_build_index
-        || opcode == sqlexec_unregister_table_indexes
-        || opcode == sqlexec_unregister_database_indexes;
+    return opcode == sqlexec_project
+        || opcode == sqlexec_table_scan
+        || opcode == sqlexec_join_scan;
 }
 
 /*
  * Core dispatch: routes an already-constructed env to the right
  * executor. Called by both sqlexec_execute and sqlexec_execute_env so
- * that the write_to_temp field is respected when executing inner
- * queries for subquery materialisation.
+ * that the redirected-output fields are respected when executing inner
+ * queries for temp materialisation or predicate-subquery collection.
  */
 static int sqlexec_dispatch(sqlexec_env *env)
 {
     const sqlexec_program *program;
     const sqlexec_node *root_node;
-    const sqlexec_node *first_node;
-    const sqlexec_node *second_node;
-    const sqlexec_node *node;
-    sqlexec_ref first_ref;
-    sqlexec_ref second_ref;
-    sqlexec_ref ref;
+    const char *table_name;
 
     program = env->program;
 
@@ -59,97 +56,36 @@ static int sqlexec_dispatch(sqlexec_env *env)
         return exec_ddl(env);
     }
 
-    if (root_node->opcode != sqlexec_sequence) {
+    table_name = program->table_name;
+    if (!table_name || table_name[0] == '\0') {
         return -1;
     }
-
-    first_ref = child_at(program, program->root, 0);
-    second_ref = child_at(program, program->root, 1);
-    if (first_ref == sqlexec_nil) {
-        return -1;
-    }
-    first_node = sqlexec_get_const(program, first_ref);
-    second_node = second_ref != sqlexec_nil
-        ? sqlexec_get_const(program, second_ref) : NULL;
-    if (!first_node) {
-        return -1;
-    }
-
-    if (is_ddl_sequence_first(first_node->opcode)) {
-        return exec_ddl(env);
-    }
-
-    if (first_node->opcode == sqlexec_run_subquery) {
-        if (exec_run_subquery(env) != 0) {
-            return -1;
-        }
-        first_ref = second_ref;
-        second_ref = child_at(program, program->root, 2);
-        first_node = second_node;
-        second_node = second_ref != sqlexec_nil
-            ? sqlexec_get_const(program, second_ref) : NULL;
-        if (!first_node) {
-            return -1;
-        }
-    }
-
-    if (first_node->opcode != sqlexec_open_table || !second_node) {
-        return -1;
-    }
-
-    if (second_node->opcode == sqlexec_emit_rows
-        || second_node->opcode == sqlexec_emit_count) {
+    if (is_select_head(root_node->opcode)) {
         int sel_ret;
-        sqlexec_ref sib;
-        sqlexec_ref last;
 
-        sel_ret = exec_select(env, first_node->data.named.name,
-            second_ref);
-        /* Clean up temp table if the last sequence child is delete_temp. */
-        sib = program->nodes[program->root].first_child;
-        last = sqlexec_nil;
-        while (sib != sqlexec_nil) {
-            last = sib;
-            sib = program->nodes[sib].next_sibling;
+        if (program_subquery_text(program)[0] != '\0') {
+            if (exec_run_subquery(env) != 0) {
+                return -1;
+            }
         }
-        if (last != sqlexec_nil
-            && program->nodes[last].opcode == sqlexec_delete_temp) {
+        sel_ret = exec_select(env, table_name, program->root);
+        if (program_subquery_text(program)[0] != '\0') {
             exec_delete_temp(env);
         }
         return sel_ret;
     }
 
-    if (second_node->opcode != sqlexec_count_affected) {
-        return -1;
+    if (root_node->opcode == sqlexec_append_record) {
+        return exec_insert(env, table_name,
+            root_node->data.assignments);
     }
 
-    ref = child_at(program, second_ref, 0);
-    if (ref == sqlexec_nil) {
-        return -1;
-    }
-    node = sqlexec_get_const(program, ref);
-    if (!node) {
-        return -1;
+    if (root_node->opcode == sqlexec_write_current) {
+        return exec_update(env, table_name, program->root);
     }
 
-    if (node->opcode == sqlexec_append_record) {
-        ref = child_at(program, ref, 0);
-        node = sqlexec_get_const(program, ref);
-        if (!node || node->opcode != sqlexec_make_record) {
-            return -1;
-        }
-        return exec_insert(env, first_node->data.named.name,
-            node->data.values);
-    }
-
-    if (node->opcode == sqlexec_write_current) {
-        return exec_update(env, first_node->data.named.name,
-            second_ref);
-    }
-
-    if (node->opcode == sqlexec_delete_current) {
-        return exec_delete(env, first_node->data.named.name,
-            second_ref);
+    if (root_node->opcode == sqlexec_delete_current) {
+        return exec_delete(env, table_name, program->root);
     }
 
     return -1;
@@ -159,6 +95,7 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
     char *current_db, const sqlexec_io *io)
 {
     sqlexec_env env;
+    unsigned short temp_serial;
     int ret;
 
     if (!root || !program || !current_db
@@ -167,12 +104,14 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
     }
 
     memset(&env, 0, sizeof(env));
+    temp_serial = 0;
     env.root       = root;
     env.program    = program;
     env.current_db = current_db;
     env.io         = io;
     env.temp       = NULL;
     env.schema     = NULL;
+    env.temp_serial = &temp_serial;
 
     ret = sqlexec_dispatch(&env);
 
@@ -186,6 +125,7 @@ int sqlexec_execute(const char *root, const sqlexec_program *program,
 int sqlexec_run(sql_context *ctx)
 {
     sqlexec_env env;
+    unsigned short temp_serial;
     int ret;
 
     if (!ctx || !ctx->root || ctx->program.root == sqlexec_nil) {
@@ -193,12 +133,14 @@ int sqlexec_run(sql_context *ctx)
     }
 
     memset(&env, 0, sizeof(env));
+    temp_serial = 0;
     env.root       = ctx->root;
     env.program    = &ctx->program;
     env.current_db = ctx->current_db;
     env.io         = &ctx->io;
     env.temp       = NULL;
     env.schema     = ctx->schema;
+    env.temp_serial = &temp_serial;
 
     ret = sqlexec_dispatch(&env);
 

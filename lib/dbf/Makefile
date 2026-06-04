@@ -2,6 +2,7 @@ cc ?= gcc
 ar ?= ar
 ranlib ?= ranlib
 sdcc ?= sdcc
+sdccflags ?= --std-c11 -mz80
 include_dir ?= ../../include
 build_dir ?= ../../build
 
@@ -37,7 +38,7 @@ $(build_dir):
 	mkdir -p $(build_dir)
 
 sdcc_check: $(sources) $(headers) | $(build_dir)
-	$(sdcc) --std-c11 -I$(include_dir) -c dbf.c -o $(sdcc_rel)
+	$(sdcc) $(sdccflags) -I$(include_dir) -c dbf.c -o $(sdcc_rel)
 
 clean:
 	rm -f $(build_dir)/libdbf_dbf.o $(build_dir)/libdbf_dbf.d

@@ -32,17 +32,29 @@ create_index    ::= CREATE [ UNIQUE ] INDEX <name> ON <name>
 create_view     ::= CREATE VIEW <name> AS select_body ;
 drop_view       ::= DROP VIEW <name> ;
 show_views      ::= SHOW VIEWS ;
-select          ::= SELECT select_list FROM from_item [join_clause]
-                    [where_clause] ;
-insert          ::= INSERT INTO <name> VALUES ( value [, value ...] ) ;
+select          ::= SELECT [ ALL | DISTINCT ] select_list
+                    FROM from_item [ table_ref_tail ... ]
+                    [where_clause] [group_by_clause]
+                    [having_clause] ;
+insert          ::= INSERT INTO <name>
+                    [ ( column_name [, column_name ...] ) ]
+                    VALUES ( value [, value ...] ) ;
 update          ::= UPDATE <name> SET assignment [, assignment ...]
                     [where_clause] ;
 delete          ::= DELETE FROM <name> [where_clause] ;
 
-select_list     ::= * | COUNT(*) | COUNT(expr) | select_item [, select_item ...]
+select_list     ::= * | COUNT(*) | select_item [, select_item ...]
 select_item     ::= column_ref [ [ AS ] column_name ]
+                  | TRIM ( column_ref ) [ [ AS ] column_name ]
+                  | COUNT ( * | column_ref ) [ [ AS ] column_name ]
+                  | MIN ( column_ref ) [ [ AS ] column_name ]
+                  | MAX ( column_ref ) [ [ AS ] column_name ]
+                  | SUM ( column_ref ) [ [ AS ] column_name ]
+                  | AVG ( column_ref ) [ [ AS ] column_name ]
 from_item       ::= <name> [ [ AS ] alias ]
                   | ( select_body ) [ [ AS ] alias ]
+table_ref_tail  ::= , from_item
+                  | join_clause
 join_clause     ::= JOIN from_item ON qualified_column = qualified_column
 column_ref      ::= column_name | qualifier . column_name
 qualified_column ::= qualifier . column_name
@@ -53,16 +65,29 @@ column_type     ::= CHAR ( n )
                   | DATE
                   | LOGICAL
 where_clause    ::= WHERE where_expr
+group_by_clause ::= GROUP BY column_ref [, column_ref ...]
+having_clause   ::= HAVING where_expr
 where_expr      ::= where_term [ OR where_term ... ]
-where_term      ::= where_primary [ AND where_primary ... ]
-where_primary   ::= column_ref op value
+where_term      ::= where_not [ AND where_not ... ]
+where_not       ::= [ NOT ] where_primary
+where_primary   ::= EXISTS ( select_body )
+                  | column_ref op value
                   | column_ref IN ( value [, value ...] )
+                  | column_ref IN ( select_body )
+                  | column_ref BETWEEN value AND value
+                  | column_ref LIKE 'pattern'
+                  | column_ref IS NULL
+                  | column_ref IS NOT NULL
+                  | column_ref op quantifier ( select_body )
                   | ( where_expr )
 assignment      ::= <column> = value
 op              ::= = | <> | != | < | <= | > | >=
-value           ::= 'string' | number | identifier
-select_body     ::= SELECT select_list FROM from_item [join_clause]
-                    [where_clause]
+quantifier      ::= ANY | ALL
+value           ::= 'string' | number | NULL | identifier
+select_body     ::= SELECT [ ALL | DISTINCT ] select_list
+                    FROM from_item [ table_ref_tail ... ]
+                    [where_clause] [group_by_clause]
+                    [having_clause]
 ```
 
 Identifiers and keywords are case-insensitive. Every top-level
@@ -71,10 +96,17 @@ and inside a subquery `(...)` does not carry its own semicolon.
 
 Current non-goals:
 - no outer joins
-- no multi-join plans
+- no unbounded join plans
 - no correlated subqueries
-- no `ORDER BY` or `GROUP BY`
-- no aggregates beyond `COUNT(*)`
+- no `ORDER BY`
+- no arbitrary scalar expressions beyond built-in function calls
+
+Implementation notes:
+- Predicate subqueries are currently limited to uncorrelated
+  single-column `SELECT` bodies.
+- Predicate subqueries are materialised before the outer scan begins.
+- `NULL` is currently stored as a blank DBF field, so blank character
+  data and `NULL` are not yet distinct stored values.
 
 ---
 
@@ -100,9 +132,12 @@ During `sql_run`, the FROM table name is checked:
 - Names beginning with `sys_` → built-in view (hardcoded in executor)
 - Other names → looked up in `sys/vw.dbf`
 
-In both cases the program builder inserts `run_subquery` and
-`delete_temp` nodes around the outer table scan, and the table name
-is redirected to `_tmp`.
+Simple base-table views and simple inline subqueries over one base
+table may flatten during lowering when safe, including plain projected
+column lists with aliases. In the remaining cases, the program builder
+redirects the table name to `_tmp` and stores the inner SQL text in
+`subquery_text`. The executor then materialises `_tmp.dbf` before the
+outer query and removes it afterward.
 
 ---
 
@@ -111,88 +146,78 @@ is redirected to `_tmp`.
 The parser builds a `sqlexec_program` — a fixed-size node arena with
 child/sibling links and no heap allocation.
 
-Key sizes: 20 nodes, 24 pooled names, 241-byte subquery text.
+Key sizes: 3 nodes, 64 pooled names, 241-byte subquery text.
 
 ### Opcode groups
 
 **Schema / catalog:**
-`create_database`, `show_databases`, `use_database`, `drop_database`,
-`create_table`, `drop_table`, `build_index`, `register_index`,
-`unregister_table_indexes`, `unregister_database_indexes`,
+`create_database`, `use_database`, `drop_database`,
+`create_table`, `drop_table`, `create_index`,
 `create_view`, `drop_view`, `show_views`
 
 **Query:**
-`open_table`, `close_table`, `table_scan`, `join_scan`,
-`index_scan_eq`, `index_scan_range`, `filter`, `project`,
-`count_rows`, `emit_rows`, `emit_count`
+`table_scan`, `join_scan`, `project`
 
 **Mutation:**
-`make_record`, `append_record`, `apply_assignments`,
-`write_current`, `delete_current`, `count_affected`,
-`rebuild_table_indexes`
-
-**Subquery / view:**
-`run_subquery`, `delete_temp`
+`append_record`, `write_current`, `delete_current`
 
 ### Tree examples
 
 `SELECT name FROM people WHERE age = 18;`
 ```
-sequence
-  open_table people
-  emit_rows
-    project name
-      filter age = 18
-        table_scan
-  close_table
+project name where age = 18
+  table_scan
 ```
 
 `SELECT * FROM active_people WHERE age > 30;` (view or subquery)
 ```
-sequence
-  run_subquery _tmp
-  open_table _tmp
-  emit_rows
-    project *
-      filter age > 30
-        table_scan
-  close_table _tmp
-  delete_temp _tmp
+project * where age > 30
+  table_scan
 ```
 
 `SELECT p.name, c.label FROM people p JOIN cities c ON p.city = c.code WHERE c.region = 'EU';`
 ```
-sequence
-  open_table people
-  emit_rows
-    project p.name, c.label
-      filter (c.region = 'EU') AND (p.city = c.code)
-        join_scan people as p join cities as c
-  close_table
+project p.name, c.label where (c.region = 'EU') AND (p.city = c.code)
+  join_scan people as p join cities as c
+```
+
+`SELECT city, MAX(age) AS max_age FROM people GROUP BY city HAVING max_age > 18;`
+```text
+project city, MAX(age) as max_age group_by city having max_age > 18
+  table_scan
+```
+
+`SELECT DISTINCT city FROM people WHERE NOT city LIKE 'N%' AND age BETWEEN 18 AND 24;`
+```text
+project DISTINCT city where (NOT city LIKE 'N%' AND (age >= 18 AND age <= 24))
+  table_scan
 ```
 
 The JOIN ON condition is merged into the WHERE tree at parse time. The
-right-hand column of the ON equality (`c.code`) is encoded as a
-`sql_value_identifier` string `"c.code"`. The filter evaluator resolves
-both column sides against all active row sources using the N-source
+right-hand column of the ON equality (`c.code`) is stored as a
+structured column operand. The WHERE evaluator resolves both column
+sides against all active row sources using the N-source
 `where_matches_n` path — no separate join-key check in the executor.
+
+Old SQL-86-style table lists use that same path. A query such as
+`FROM people p, cities c WHERE p.city = c.code` lowers to the same
+`join_scan` plus shared N-source WHERE model; only the equality comes
+from the user-written `WHERE` clause instead of a `JOIN ... ON ...`
+rewrite.
 
 `INSERT INTO people VALUES ('alice', 30, T);`
 ```
-sequence
-  open_table people
-  count_affected
-    append_record
-      make_record values=3
-  rebuild_table_indexes people
-  close_table
+append_record values=3
+```
+
+`INSERT INTO people (age, name) VALUES (30, 'alice');`
+```
+append_record values=2
 ```
 
 `CREATE UNIQUE INDEX age_idx ON people (age);`
 ```
-sequence
-  build_index age_idx on people (age) unique
-  register_index age_idx on people (age) unique
+create_index age_idx on people (age) unique
 ```
 
 ---
@@ -204,22 +229,24 @@ sequence
 **What it does:**
 - reads `sys/ndx.dbf` for registered indexes in the active database
 - matches single-field indexes only
-- considers only filters with a single simple comparison
+- searches top-level conjunctive `WHERE` terms for simple literal
+  comparisons
 - checks field-type compatibility with the comparison value
+- records source-local access on `table_scan` as full scan, equality,
+  or range
+- prunes top-level predicates already enforced by the chosen index
+  access and compacts the remaining `WHERE` tree
 
 **Current rewrites:**
 
 | Before | After |
 |---|---|
-| `filter(col = val → table_scan)` | `filter(col = val → index_scan_eq)` |
-| `filter(col < val → table_scan)` | `filter(col < val → index_scan_range)` |
-| same for `<=`, `>`, `>=` | — |
-
-The `filter` node stays in place after rewrite as a correctness guard.
+| `project ... where age = 18` / `table_scan` | `project ...` / `table_scan people_age = 18` |
+| `project ... where age >= 18` / `table_scan` | `project ...` / `table_scan people_age >= 18` |
+| `project ... where age >= 18 AND city = 'LON'` / `table_scan` | `project ... where city = 'LON'` / `table_scan people_age >= 18` |
 
 **Not yet:**
 - composite-index selection
-- multi-predicate reasoning
 - `IN (...)` optimization
 - join optimization
 - cost-based index choice
@@ -231,14 +258,19 @@ The `filter` node stays in place after rewrite as a correctness guard.
 `lib/sqlexec` executes the optimized tree against DBF and NDX storage.
 
 **Index scanning:**
-- `index_scan_eq` — B-tree probe; walks with key comparison for
-  non-unique indexes
-- `index_scan_range` — B-tree walk stopping when past the upper bound
+- equality access on `table_scan` — B-tree probe; walks with key
+  comparison for non-unique indexes
+- range access on `table_scan` — B-tree walk stopping when past the
+  upper bound
 
 **Subquery materialisation:**
-- `run_subquery` parses and executes the inner SQL (or calls a
-  built-in generator), writing projected rows into `_tmp.dbf`
-- `delete_temp` removes `_tmp.dbf` after the outer query closes it
+- when `subquery_text` is present on a query root, the executor parses
+  and executes the inner SQL (or calls a built-in generator), writing
+  projected rows into `_tmp.dbf`
+- the executor removes `_tmp.dbf` after the outer query finishes
+- simple base-table views and simple inline one-table subqueries,
+  including plain projected column lists with aliases, may flatten
+  earlier and therefore skip `_tmp.dbf` entirely
 
 **Join execution:**
 For join queries, the ON condition lives in the WHERE tree as a compare
@@ -305,10 +337,21 @@ Lists all live user-defined views for the current database.
 Scans live rows, applies the optional WHERE expression, and projects
 columns. Deleted rows are skipped. FROM may reference a table, a
 user-defined view, a built-in `sys_*` view, or an inline subquery.
-One optional `JOIN` is supported.
+Up to 4 total row sources are supported across comma-separated table
+lists and/or 3 INNER JOIN clauses.
+`GROUP BY` and `SELECT DISTINCT` each keep up to 8 in-memory result
+rows per statement. `HAVING` uses the same boolean operators as
+`WHERE`, but references projected output names or aliases instead of
+base-table qualifiers. `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `SUM`,
+and `AVG` are supported; `SUM` and `AVG` currently require
+integer-compatible numeric fields and `AVG` returns an integer average.
 
 ### `INSERT INTO <name> VALUES (...)`
 Appends one record and rebuilds all registered indexes.
+
+### `INSERT INTO <name> (<col ...>) VALUES (...)`
+Appends one record, maps each input value to the named target column,
+leaves unspecified fields blank, and rebuilds all registered indexes.
 
 ### `UPDATE <name> SET ... [WHERE ...]`
 Rewrites matching rows in place, rebuilds indexes on any change.
@@ -361,11 +404,22 @@ tables or views.
 | Databases per root | 15 |
 | Columns per table | 16 |
 | Identifier length | 16 characters |
-| Value text length | 32 characters |
+| Value text length | 33 characters |
 | Plan nodes per statement | 20 |
-| Pooled names per plan | 24 |
-| WHERE nodes per statement | 16 |
-| WHERE values per statement | 16 |
+| Pooled names per plan | 64 |
+| Row sources per SELECT | 4 |
+| JOIN clauses per SELECT | 3 |
+| WHERE nodes per statement | 48 |
+| WHERE values per statement | 32 |
+| HAVING nodes per statement | 48 |
+| HAVING values per statement | 32 |
+| Distinct groups per grouped SELECT | 8 |
 | Subquery nesting | 1 level |
 | Maximum record buffer | 4096 bytes |
 | View SQL text length | 240 characters |
+
+Practical WHERE capacity depends on shape. A flat `AND` chain of simple
+comparisons uses one compare node plus one connector node per extra
+term, so the current 48-node budget fits up to 24 simple predicates in
+single-table queries. JOIN `ON` conditions and `IN (...)` lists consume
+the same fixed pools.

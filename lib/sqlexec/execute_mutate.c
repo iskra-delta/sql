@@ -47,26 +47,49 @@ static void mut_write_uint(const sqlexec_env *env, unsigned short n)
 /* ------------------------------------------------------------------ */
 
 int exec_insert(sqlexec_env *env, const char *table_name,
-    sqlexec_span values)
+    sqlexec_span assignments)
 {
     dbf_file file;
     dbf_field fields[sql_max_columns];
     unsigned short offsets[sql_max_columns];
     char record[table_record_size];
+    int field_index;
+    int explicit_names;
     unsigned short index;
 
     if (open_table_file(env->root, env->current_db, table_name, &file,
         fields, offsets) != 0) {
         return -1;
     }
-    if (values.count != file.field_count) {
+    clear_record(record, file.record_length);
+    explicit_names = 0;
+    for (index = 0; index < assignments.count; index++) {
+        if (program_assignments(env->program)[assignments.first + index]
+            .column_name[0] != '\0') {
+            explicit_names = 1;
+            break;
+        }
+    }
+    if (!explicit_names && assignments.count != file.field_count) {
         dbf_close(&file);
         return -1;
     }
-    clear_record(record, file.record_length);
-    for (index = 0; index < file.field_count; index++) {
-        if (store_value_in_field(record + offsets[index], &fields[index],
-            &env->program->values[values.first + index]) != 0) {
+    for (index = 0; index < assignments.count; index++) {
+        if (!explicit_names) {
+            field_index = (int)index;
+        } else {
+            field_index = find_field_index(fields, file.field_count,
+                program_assignments(env->program)[assignments.first + index]
+                    .column_name);
+            if (field_index < 0) {
+                dbf_close(&file);
+                return -1;
+            }
+        }
+        if (store_value_in_field(record + offsets[field_index],
+            &fields[field_index],
+            &program_assignments(env->program)[assignments.first + index]
+                .value) != 0) {
             dbf_close(&file);
             return -1;
         }
@@ -92,13 +115,14 @@ int exec_insert(sqlexec_env *env, const char *table_name,
 /* ------------------------------------------------------------------ */
 
 int exec_update(sqlexec_env *env, const char *table_name,
-    sqlexec_ref count_ref)
+    sqlexec_ref action_ref)
 {
-    const sqlexec_node *apply_node;
+    const sqlexec_node *write_node;
     const sqlexec_node *scan_node;
     dbf_file file;
     dbf_field fields[sql_max_columns];
     unsigned short offsets[sql_max_columns];
+    unsigned short assignment_fields[sql_max_columns];
     char record[table_record_size];
     sql_where where;
     unsigned long index;
@@ -109,20 +133,21 @@ int exec_update(sqlexec_env *env, const char *table_name,
     row_source source;
     int state;
     int field_index;
-    ndx_file ndx;
+    where_binding where_binding_storage;
+    const where_binding *where_binding;
     exec_index_scan_ctx scan_ctx;
-    int scan_result;
+    sql_predicate_subquery_cache predicate_subqueries;
 
-    ref = child_at(env->program, count_ref, 0);
+    memset(&predicate_subqueries, 0, sizeof(predicate_subqueries));
+    where_binding = NULL;
+
+    ref = action_ref;
     if (ref == sqlexec_nil
-        || env->program->nodes[ref].opcode
-            != sqlexec_write_current) {
+        || env->program->nodes[ref].opcode != sqlexec_write_current) {
         return -1;
     }
-    ref = child_at(env->program, ref, 0);
-    apply_node = sqlexec_get_const(env->program, ref);
-    if (!apply_node
-        || apply_node->opcode != sqlexec_apply_assignments
+    write_node = sqlexec_get_const(env->program, ref);
+    if (!write_node
         || resolve_scan_node(env->program,
             child_at(env->program, ref, 0), &where,
             &scan_ref) != 0) {
@@ -140,19 +165,37 @@ int exec_update(sqlexec_env *env, const char *table_name,
     source.field_count = file.field_count;
 
     for (assignment_index = 0;
-        assignment_index < apply_node->data.assignments.count;
+        assignment_index < write_node->data.assignments.count;
         assignment_index++) {
         field_index = find_field_index(fields, file.field_count,
-            env->program->assignments[
-                apply_node->data.assignments.first
+            program_assignments(env->program)[
+                write_node->data.assignments.first
                     + assignment_index].column_name);
         if (field_index < 0) {
             dbf_close(&file);
             return -1;
         }
+        assignment_fields[assignment_index] = (unsigned short)field_index;
     }
-    if (!where_references_known_fields(env->program, &where,
-        &source, NULL)) {
+    if (!where_can_use_program_binding(env->program, &where)) {
+        if (where_bind_n(env->program, &where, &source, 1,
+            &where_binding_storage) != 0) {
+            dbf_close(&file);
+            return -1;
+        }
+        where_binding = &where_binding_storage;
+    }
+    if (where_is_constant_false(&where, env->program->where_nodes)) {
+        if (dbf_close(&file) != 0) {
+            return -1;
+        }
+        mut_write_uint(env, 0);
+        mut_write_str(env, " updated");
+        mut_write_nl(env);
+        return 0;
+    }
+    if (env->program->predicate_subquery_count > 0
+        && load_predicate_subqueries(env, &predicate_subqueries) != 0) {
         dbf_close(&file);
         return -1;
     }
@@ -167,15 +210,8 @@ int exec_update(sqlexec_env *env, const char *table_name,
     }
 
     changed_count = 0;
-    if (scan_node->opcode != sqlexec_table_scan) {
-        if (open_ndx(env, scan_node->opcode == sqlexec_index_scan_eq
-            ? scan_node->data.index_probe.index_name
-            : scan_node->data.index_range.index_name, &ndx) != 0) {
-            dbf_close(&file);
-            return -1;
-        }
+    if (scan_uses_index(scan_node)) {
         memset(&scan_ctx, 0, sizeof(scan_ctx));
-        scan_ctx.ndx = &ndx;
         scan_ctx.file = &file;
         scan_ctx.fields = fields;
         scan_ctx.offsets = offsets;
@@ -183,47 +219,13 @@ int exec_update(sqlexec_env *env, const char *table_name,
         scan_ctx.source = &source;
         scan_ctx.env = env;
         scan_ctx.where = &where;
+        scan_ctx.where_binding = where_binding;
         scan_ctx.action = exec_scan_update;
-        scan_ctx.apply_node = apply_node;
+        scan_ctx.write_node = write_node;
+        scan_ctx.assignment_fields = assignment_fields;
         scan_ctx.changed_count = &changed_count;
-
-        if (scan_node->opcode == sqlexec_index_scan_eq) {
-            if (build_eq_key(&ndx,
-                &scan_node->data.index_probe.value,
-                scan_ctx.eq_key) != 0) {
-                ndx_close(&ndx);
-                dbf_close(&file);
-                return -1;
-            }
-            scan_result = ndx_scan(&ndx, exec_eq_scan_callback,
-                &scan_ctx);
-        } else {
-            if (scan_node->data.index_range.lower_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_lower = 1;
-                scan_ctx.lower_incl =
-                    scan_node->data.index_range.lower_operator
-                    == sql_compare_greater_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.lower_value,
-                    scan_ctx.lower_key);
-            }
-            if (scan_node->data.index_range.upper_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_upper = 1;
-                scan_ctx.upper_incl =
-                    scan_node->data.index_range.upper_operator
-                    == sql_compare_less_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.upper_value,
-                    scan_ctx.upper_key);
-            }
-            scan_result = ndx_scan(&ndx, exec_range_scan_callback,
-                &scan_ctx);
-        }
-
-        ndx_close(&ndx);
-        if (scan_ctx.failed || scan_result < 0) {
+        scan_ctx.subqueries = &predicate_subqueries;
+        if (exec_run_index_scan(env, scan_node, &scan_ctx) != 0) {
             dbf_close(&file);
             return -1;
         }
@@ -237,20 +239,18 @@ int exec_update(sqlexec_env *env, const char *table_name,
             if (state == 1) {
                 continue;
             }
-            if (!where_matches(env->program, &where, &source, NULL)) {
+            if (!where_matches_bound_n(env->program, &where, where_binding,
+                &source, &predicate_subqueries)) {
                 continue;
             }
             for (assignment_index = 0;
-                assignment_index < apply_node->data.assignments.count;
+                assignment_index < write_node->data.assignments.count;
                 assignment_index++) {
-                field_index = find_field_index(fields, file.field_count,
-                    env->program->assignments[
-                        apply_node->data.assignments.first
-                            + assignment_index].column_name);
+                field_index = (int)assignment_fields[assignment_index];
                 if (store_value_in_field(record + offsets[field_index],
                     &fields[field_index],
-                    &env->program->assignments[
-                        apply_node->data.assignments.first
+                    &program_assignments(env->program)[
+                        write_node->data.assignments.first
                             + assignment_index].value) != 0) {
                     dbf_close(&file);
                     return -1;
@@ -282,7 +282,7 @@ int exec_update(sqlexec_env *env, const char *table_name,
 /* ------------------------------------------------------------------ */
 
 int exec_delete(sqlexec_env *env, const char *table_name,
-    sqlexec_ref count_ref)
+    sqlexec_ref action_ref)
 {
     const sqlexec_node *scan_node;
     dbf_file file;
@@ -296,14 +296,17 @@ int exec_delete(sqlexec_env *env, const char *table_name,
     sqlexec_ref ref;
     row_source source;
     int state;
-    ndx_file ndx;
+    where_binding where_binding_storage;
+    const where_binding *where_binding;
     exec_index_scan_ctx scan_ctx;
-    int scan_result;
+    sql_predicate_subquery_cache predicate_subqueries;
 
-    ref = child_at(env->program, count_ref, 0);
+    memset(&predicate_subqueries, 0, sizeof(predicate_subqueries));
+    where_binding = NULL;
+
+    ref = action_ref;
     if (ref == sqlexec_nil
-        || env->program->nodes[ref].opcode
-            != sqlexec_delete_current
+        || env->program->nodes[ref].opcode != sqlexec_delete_current
         || resolve_scan_node(env->program,
             child_at(env->program, ref, 0), &where,
             &scan_ref) != 0) {
@@ -319,8 +322,25 @@ int exec_delete(sqlexec_env *env, const char *table_name,
     source.offsets = offsets;
     source.record = record;
     source.field_count = file.field_count;
-    if (!where_references_known_fields(env->program, &where,
-        &source, NULL)) {
+    if (!where_can_use_program_binding(env->program, &where)) {
+        if (where_bind_n(env->program, &where, &source, 1,
+            &where_binding_storage) != 0) {
+            dbf_close(&file);
+            return -1;
+        }
+        where_binding = &where_binding_storage;
+    }
+    if (where_is_constant_false(&where, env->program->where_nodes)) {
+        if (dbf_close(&file) != 0) {
+            return -1;
+        }
+        mut_write_uint(env, 0);
+        mut_write_str(env, " deleted");
+        mut_write_nl(env);
+        return 0;
+    }
+    if (env->program->predicate_subquery_count > 0
+        && load_predicate_subqueries(env, &predicate_subqueries) != 0) {
         dbf_close(&file);
         return -1;
     }
@@ -335,15 +355,8 @@ int exec_delete(sqlexec_env *env, const char *table_name,
     }
 
     deleted_count = 0;
-    if (scan_node->opcode != sqlexec_table_scan) {
-        if (open_ndx(env, scan_node->opcode == sqlexec_index_scan_eq
-            ? scan_node->data.index_probe.index_name
-            : scan_node->data.index_range.index_name, &ndx) != 0) {
-            dbf_close(&file);
-            return -1;
-        }
+    if (scan_uses_index(scan_node)) {
         memset(&scan_ctx, 0, sizeof(scan_ctx));
-        scan_ctx.ndx = &ndx;
         scan_ctx.file = &file;
         scan_ctx.fields = fields;
         scan_ctx.offsets = offsets;
@@ -351,46 +364,11 @@ int exec_delete(sqlexec_env *env, const char *table_name,
         scan_ctx.source = &source;
         scan_ctx.env = env;
         scan_ctx.where = &where;
+        scan_ctx.where_binding = where_binding;
         scan_ctx.action = exec_scan_delete;
         scan_ctx.deleted_count = &deleted_count;
-
-        if (scan_node->opcode == sqlexec_index_scan_eq) {
-            if (build_eq_key(&ndx,
-                &scan_node->data.index_probe.value,
-                scan_ctx.eq_key) != 0) {
-                ndx_close(&ndx);
-                dbf_close(&file);
-                return -1;
-            }
-            scan_result = ndx_scan(&ndx, exec_eq_scan_callback,
-                &scan_ctx);
-        } else {
-            if (scan_node->data.index_range.lower_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_lower = 1;
-                scan_ctx.lower_incl =
-                    scan_node->data.index_range.lower_operator
-                    == sql_compare_greater_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.lower_value,
-                    scan_ctx.lower_key);
-            }
-            if (scan_node->data.index_range.upper_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_upper = 1;
-                scan_ctx.upper_incl =
-                    scan_node->data.index_range.upper_operator
-                    == sql_compare_less_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.upper_value,
-                    scan_ctx.upper_key);
-            }
-            scan_result = ndx_scan(&ndx, exec_range_scan_callback,
-                &scan_ctx);
-        }
-
-        ndx_close(&ndx);
-        if (scan_ctx.failed || scan_result < 0) {
+        scan_ctx.subqueries = &predicate_subqueries;
+        if (exec_run_index_scan(env, scan_node, &scan_ctx) != 0) {
             dbf_close(&file);
             return -1;
         }
@@ -404,7 +382,8 @@ int exec_delete(sqlexec_env *env, const char *table_name,
             if (state == 1) {
                 continue;
             }
-            if (!where_matches(env->program, &where, &source, NULL)) {
+            if (!where_matches_bound_n(env->program, &where, where_binding,
+                &source, &predicate_subqueries)) {
                 continue;
             }
             if (dbf_delete(&file, index) != 0) {

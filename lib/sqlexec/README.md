@@ -34,18 +34,23 @@ Important properties:
 - no heap allocation
 - `first_child` for nested input
 - `next_sibling` for ordered siblings
-- shared pools for names, columns, values, assignments, and `WHERE`
-  expression payloads
+- shared pools for names and `WHERE` expression payloads
+- one statement-specific storage union for create-table columns,
+  mutation assignments, or subquery/view SQL text
 
 Current hard limits:
 
-- 32 nodes per statement
+- 2 nodes per statement
 - 16 pooled columns
-- 16 pooled values
 - 16 pooled assignments
-- 16 `WHERE` nodes
-- 16 `WHERE` values
-- 32 pooled names
+- 48 `WHERE` nodes
+- 32 `WHERE` values
+- 48 `HAVING` nodes
+- 32 `HAVING` values
+- 64 pooled names
+- 8 predicate subqueries per statement
+- 32 cached rows per predicate subquery
+- 8 in-memory groups per grouped `SELECT`
 
 ## Current Opcode Set
 
@@ -53,39 +58,30 @@ Schema and catalog:
 
 - `sequence`
 - `create_database`
-- `show_databases`
 - `use_database`
 - `drop_database`
 - `create_table`
 - `drop_table`
-- `build_index`
-- `register_index`
-- `unregister_table_indexes`
-- `unregister_database_indexes`
+- `create_index`
 
 Query:
 
-- `open_table`
-- `close_table`
 - `table_scan`
 - `join_scan`
-- `index_scan_eq`
-- `index_scan_range`
-- `filter`
 - `project`
-- `count_rows`
-- `emit_rows`
-- `emit_count`
 
 Mutation:
 
-- `make_record`
 - `append_record`
-- `apply_assignments`
 - `write_current`
 - `delete_current`
-- `count_affected`
-- `rebuild_table_indexes`
+
+Materialised FROM subqueries and views are not separate opcodes.
+Simple base-table views and simple inline one-table subqueries,
+including plain projected column lists with aliases, may flatten away
+before execution. The remaining cases are driven by
+`program->table_name` plus `program_subquery_text(program)`, with executor
+helpers in `execute_subquery.c`.
 
 ## Canonical Plan Shapes
 
@@ -95,47 +91,45 @@ executor recognizes those shapes directly.
 Example `SELECT name FROM people WHERE age = 18;`
 
 ```text
-sequence
-  open_table people
-  emit_rows
-    project name
-      filter age = 18
-        table_scan
-  close_table
+project name where age = 18
+  table_scan
 ```
 
 Example `SELECT p.name, c.title FROM people AS p JOIN cities c
 ON p.city = c.code;`
 
 ```text
-sequence
-  open_table people
-  emit_rows
-    project p.name, c.title
-      join_scan people as p join cities as c on p.city = c.code
-  close_table
+project p.name, c.title
+  join_scan people as p join cities as c on p.city = c.code
+```
+
+Example `SELECT p.name, c.title FROM people AS p, cities c
+WHERE p.city = c.code;`
+
+```text
+project p.name, c.title where p.city = c.code
+  join_scan people as p join cities as c
+```
+
+Example `SELECT city, MAX(age) AS max_age FROM people GROUP BY city
+HAVING max_age > 18;`
+
+```text
+project city, MAX(age) as max_age group_by city having max_age > 18
+  table_scan
 ```
 
 Example `UPDATE people SET age = 19 WHERE age = 18;`
 
 ```text
-sequence
-  open_table people
-  count_affected
-    write_current
-      apply_assignments assignments=1
-        filter age = 18
-          table_scan
-  rebuild_table_indexes people
-  close_table
+write_current assignments=1
+  table_scan
 ```
 
 Example `CREATE INDEX people_name ON people (name);`
 
 ```text
-sequence
-  build_index people_name on people (name)
-  register_index people_name on people (name)
+create_index people_name on people (name)
 ```
 
 ## Public API
@@ -155,7 +149,6 @@ Payload pool helpers:
 
 - `sqlexec_add_names()`
 - `sqlexec_add_columns()`
-- `sqlexec_add_values()`
 - `sqlexec_add_assignments()`
 
 Validation and inspection:
@@ -182,16 +175,21 @@ The hosted executor owns:
 
 Current execution caveat:
 
-- optimizer-produced `index_scan_eq` and `index_scan_range` nodes are
-  accepted structurally
-- `filter` nodes evaluate full boolean `WHERE` trees, including
-  `AND`, `OR`, and `IN (...)`
-- `join_scan` currently runs as one nested-loop inner join
-- actual row access still happens through full table scans today
-- the `filter` node remains the correctness guard
-
-So the executor already consumes optimized trees, but indexed row
-retrieval is still future work.
+- project roots carry full boolean `WHERE` trees, including `AND`,
+  `OR`, `NOT`, `IN (...)`, `IN (SELECT ...)`, `BETWEEN`, `LIKE`,
+  `IS NULL`, `IS NOT NULL`, `EXISTS`, and quantified `ANY` / `ALL`
+  comparisons with three-valued logic
+- `join_scan` currently runs as one nested-loop inner join for both
+  comma-style table lists and `JOIN ... ON ...` queries
+- grouped `SELECT` and `SELECT DISTINCT` keep bounded in-memory result
+  tables and apply `HAVING` after aggregation
+- predicate subqueries are currently limited to uncorrelated
+  single-column SELECTs and are materialised into bounded caches before
+  the outer scan begins
+- optimizer-selected access on `table_scan` drives real NDX lookups for
+  simple SELECT, COUNT, DISTINCT, grouped, UPDATE, and DELETE paths
+- top-level predicates already enforced by index access are pruned from
+  the residual `WHERE` tree before execution
 
 ## Output Boundary
 
@@ -207,8 +205,14 @@ This keeps shell I/O outside the executor and keeps `main` small.
 
 ## Notes
 
-- `sequence` nodes model ordered side effects such as open, work,
-  rebuild, and close.
-- `COUNT(*)` lowers as `emit_count(count_rows(...))`.
+- `sequence` remains available as a generic tree helper, but parser-
+  generated SELECT and mutation plans now store their target table in
+  `program->table_name` and start directly at the operation root.
+- `COUNT(*)` lowers as a count-only scan at the root, with `WHERE`
+  stored on the shared program predicate tree.
+- grouped aggregates such as `COUNT(col)`, `MIN(col)`, `MAX(col)`,
+  `SUM(col)`, and `AVG(col)` stay inside the normal
+  `project(...)` shape; the project metadata switches the executor into
+  grouped mode.
 - Mutation paths rebuild registered indexes after table changes because
   incremental NDX maintenance is not implemented yet.

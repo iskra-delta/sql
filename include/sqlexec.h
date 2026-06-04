@@ -13,10 +13,10 @@
 
 #include "sqltypes.h"
 
-#define sqlexec_max_nodes 20
-#define sqlexec_max_names 24
+#define sqlexec_max_nodes 2
+#define sqlexec_max_names 64
 
-typedef unsigned short sqlexec_ref;
+typedef unsigned char sqlexec_ref;
 
 #ifndef sqlexec_program_declared
 #define sqlexec_program_declared
@@ -24,44 +24,27 @@ struct sqlexec_program;
 typedef struct sqlexec_program sqlexec_program;
 #endif
 
-#define sqlexec_nil ((sqlexec_ref)0xffffu)
+#define sqlexec_nil ((sqlexec_ref)0xffu)
 
-typedef enum sqlexec_opcode {
+typedef unsigned char sqlexec_opcode;
+enum {
     sqlexec_invalid = 0,
     sqlexec_sequence,
     sqlexec_create_database,
-    sqlexec_show_databases,
     sqlexec_use_database,
     sqlexec_drop_database,
     sqlexec_create_table,
     sqlexec_drop_table,
-    sqlexec_build_index,
-    sqlexec_register_index,
-    sqlexec_unregister_table_indexes,
-    sqlexec_unregister_database_indexes,
-    sqlexec_open_table,
-    sqlexec_close_table,
+    sqlexec_create_index,
     sqlexec_table_scan,
     sqlexec_join_scan,
-    sqlexec_index_scan_eq,
-    sqlexec_index_scan_range,
-    sqlexec_filter,
     sqlexec_project,
-    sqlexec_make_record,
     sqlexec_append_record,
-    sqlexec_apply_assignments,
     sqlexec_write_current,
     sqlexec_delete_current,
-    sqlexec_count_rows,
-    sqlexec_count_affected,
-    sqlexec_emit_rows,
-    sqlexec_emit_count,
-    sqlexec_rebuild_table_indexes,
     sqlexec_create_view,
-    sqlexec_drop_view,
-    sqlexec_run_subquery,
-    sqlexec_delete_temp
-} sqlexec_opcode;
+    sqlexec_drop_view
+};
 
 typedef struct sqlexec_span {
     unsigned char first;
@@ -77,6 +60,22 @@ typedef struct sqlexec_table_def {
     sqlexec_span columns;
 } sqlexec_table_def;
 
+typedef unsigned char sqlexec_scan_access_kind;
+enum {
+    sqlexec_scan_full = 0,
+    sqlexec_scan_index_eq,
+    sqlexec_scan_index_range
+};
+
+typedef struct sqlexec_scan_def {
+    sqlexec_scan_access_kind access_kind;
+    char index_name[sql_name_size];
+    sql_compare_operator lower_operator;
+    sql_compare_operator upper_operator;
+    sql_value lower_value;
+    sql_value upper_value;
+} sqlexec_scan_def;
+
 typedef struct sqlexec_index_def {
     char index_name[sql_name_size];
     char table_name[sql_name_size];
@@ -86,53 +85,49 @@ typedef struct sqlexec_index_def {
 
 typedef struct sqlexec_project_def {
     unsigned char select_all;
+    unsigned char distinct;
+    unsigned char has_aggregate;
+    sql_select_function functions[sql_max_columns];
+    unsigned char function_arg_is_star[sql_max_columns];
     sqlexec_span qualifiers;
     sqlexec_span names;
     sqlexec_span aliases;
+    sqlexec_span group_qualifiers;
+    sqlexec_span group_names;
 } sqlexec_project_def;
 
 /* Accessor macros for join name spans in program->names[]. */
-#define join_left_table(p, j)   (p)->names[(j).tables.first + 0]
-#define join_left_alias(p, j)   (p)->names[(j).tables.first + 1]
-#define join_right_table(p, j)  (p)->names[(j).tables.first + 2]
-#define join_right_alias(p, j)  (p)->names[(j).tables.first + 3]
+#define join_source_count(j) ((unsigned char)((j).tables.count / 2u))
+#define join_table_at(p, j, i) \
+    (p)->names[(j).tables.first + ((unsigned char)(i) * 2u)]
+#define join_alias_at(p, j, i) \
+    (p)->names[(j).tables.first + ((unsigned char)(i) * 2u) + 1u]
+#define join_left_table(p, j)   join_table_at(p, j, 0)
+#define join_left_alias(p, j)   join_alias_at(p, j, 0)
+#define join_right_table(p, j)  join_table_at(p, j, 1)
+#define join_right_alias(p, j)  join_alias_at(p, j, 1)
 
 /*
  * Join definition stored as spans into the program's names[] pool.
- * tables: names[first]=left_table, names[first+1]=left_alias,
- *                        names[first+2]=right_table, names[first+3]=right_alias
+ * tables: names[first + 2*i] = table_i, names[first + 2*i + 1] = alias_i
+ * for every source table in the join order, starting with the base FROM
+ * table and followed by every JOIN source.
  * The ON condition is stored in the WHERE tree as a regular compare
- * node with the right-hand column encoded as a sql_value_identifier
- * "qualifier.name" string — no separate keys storage needed.
+ * node with a structured right-hand column operand — no separate keys
+ * storage needed.
  */
 typedef struct sqlexec_join_def {
-    sqlexec_span tables;   /* 4 names: left_table, left_alias, right_table, right_alias */
+    sqlexec_span tables;   /* 2 * source_count names: table_0, alias_0, ... */
 } sqlexec_join_def;
-
-typedef struct sqlexec_index_probe {
-    char index_name[sql_name_size];
-    sql_value value;
-} sqlexec_index_probe;
-
-typedef struct sqlexec_index_range {
-    char index_name[sql_name_size];
-    sql_compare_operator lower_operator;
-    sql_compare_operator upper_operator;
-    sql_value lower_value;
-    sql_value upper_value;
-} sqlexec_index_range;
 
 typedef union sqlexec_payload {
     sqlexec_named named;
     sqlexec_table_def table;
+    sqlexec_scan_def scan;
     sqlexec_index_def index;
     sqlexec_project_def project;
     sqlexec_join_def join;
-    sqlexec_span values;
     sqlexec_span assignments;
-    sql_where where;
-    sqlexec_index_probe index_probe;
-    sqlexec_index_range index_range;
 } sqlexec_payload;
 
 typedef struct sqlexec_node {
@@ -148,26 +143,63 @@ typedef struct sqlexec_io {
     sqlexec_write_char_fn write_char;
 } sqlexec_io;
 
+typedef union sqlexec_program_storage {
+    struct {
+        unsigned char column_count;
+        sql_column columns[sql_max_columns];
+    } table;
+    struct {
+        unsigned char assignment_count;
+        sql_assignment assignments[sql_max_columns];
+    } mutate;
+    char subquery_text[sql_subquery_size];
+} sqlexec_program_storage;
+
+#define program_column_count(p) ((p)->storage.table.column_count)
+#define program_columns(p) ((p)->storage.table.columns)
+#define program_assignment_count(p) ((p)->storage.mutate.assignment_count)
+#define program_assignments(p) ((p)->storage.mutate.assignments)
+#define program_subquery_text(p) ((p)->storage.subquery_text)
+
 struct sqlexec_program {
     sqlexec_ref root;
     sqlexec_ref free_head;
-    unsigned short node_count;
+    unsigned char node_count;
     sqlexec_node nodes[sqlexec_max_nodes];
+    /* Target table for SELECT / INSERT / UPDATE / DELETE plans. */
+    char table_name[sql_name_size];
     unsigned char name_count;
     char names[sqlexec_max_names][sql_name_size];
-    unsigned char column_count;
-    sql_column columns[sql_max_columns];
-    unsigned char value_count;
-    sql_value values[sql_max_columns];
-    unsigned char assignment_count;
-    sql_assignment assignments[sql_max_columns];
-    unsigned char where_node_count;
+    sqlexec_program_storage storage;
+    unsigned char predicate_subquery_count;
+    char predicate_subqueries[sql_max_predicate_subqueries]
+        [sql_subquery_size];
+    unsigned char predicate_node_count;
+    unsigned char predicate_value_count;
+    sql_where where;
+    unsigned char having_node_first;
+    unsigned char having_value_first;
+    unsigned char where_source_mask_count;
+    unsigned char where_source_masks[sql_where_max_nodes];
+    unsigned char where_bound_slot_count;
+    unsigned char where_left_slots[sql_where_max_nodes];
     sql_where_node where_nodes[sql_where_max_nodes];
-    unsigned char where_value_count;
-    sql_value where_values[sql_where_max_values];
-    /* SQL text for one subquery or view expansion per program. */
-    char subquery_text[sql_subquery_size];
+    unsigned char where_value_slots[sql_where_max_values];
+    sql_predicate_operand where_values[sql_where_max_values];
+    sql_where having;
 };
+
+static inline const sql_where_node *program_having_nodes(
+    const sqlexec_program *program)
+{
+    return program->where_nodes + program->having_node_first;
+}
+
+static inline const sql_predicate_operand *program_having_values(
+    const sqlexec_program *program)
+{
+    return program->where_values + program->having_value_first;
+}
 
 /*
  * Resets the plan arena and returns every node to the free list.
@@ -246,13 +278,6 @@ int sqlexec_add_columns(sqlexec_program *program,
     unsigned char count, unsigned char *first_out);
 
 /*
- * Copies one VALUES list into the program-owned pool.
- * Returns zero on success and -1 on overflow or invalid input.
- */
-int sqlexec_add_values(sqlexec_program *program, const sql_value *values,
-    unsigned char count, unsigned char *first_out);
-
-/*
  * Copies one SET assignment list into the program-owned pool.
  * Returns zero on success and -1 on overflow or invalid input.
  */
@@ -281,17 +306,6 @@ int sqlexec_validate(const sqlexec_program *program);
 int sqlexec_dump(const sqlexec_program *program, char *text,
     unsigned short size);
 #endif
-
-/*
- * Extracts the source table name and SELECT column information from a
- * compiled SELECT program. Used by exec_sql_to_temp to determine the
- * temp table schema without re-walking the tree at every call site.
- * Returns zero on success and -1 when the program is not a SELECT.
- */
-int sqlexec_get_output_info(const sqlexec_program *program,
-    const char **table_name_out,
-    unsigned char *select_all_out,
-    sqlexec_span *names_out);
 
 /*
  * Executes one validated execution tree against the DBF/NDX storage

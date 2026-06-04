@@ -41,6 +41,42 @@ static void sel_write_uint(const sqlexec_env *env, unsigned short n)
     sel_write_str(env, buf);
 }
 
+static void long_to_text(long value, char *buf)
+{
+    unsigned short index;
+    unsigned short left;
+    unsigned short right;
+    unsigned long magnitude;
+    char tmp;
+
+    if (value == 0) {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return;
+    }
+
+    index = 0;
+    magnitude = value < 0 ? (unsigned long)(-value) : (unsigned long)value;
+    while (magnitude > 0UL && index + 1 < sql_value_size) {
+        buf[index++] = (char)('0' + (magnitude % 10UL));
+        magnitude /= 10UL;
+    }
+    if (value < 0 && index + 1 < sql_value_size) {
+        buf[index++] = '-';
+    }
+    buf[index] = '\0';
+
+    left = 0;
+    right = index == 0 ? 0 : (unsigned short)(index - 1);
+    while (left < right) {
+        tmp = buf[left];
+        buf[left] = buf[right];
+        buf[right] = tmp;
+        left++;
+        right--;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Tree navigation helpers                                              */
 /* ------------------------------------------------------------------ */
@@ -49,54 +85,862 @@ static void sel_write_uint(const sqlexec_env *env, unsigned short n)
 /* Row output                                                           */
 /* ------------------------------------------------------------------ */
 
-static void write_projected_row(const sqlexec_env *env,
-    const sqlexec_project_def *project, const row_source *left_source,
-    const row_source *right_source)
+static int write_output_values(const sqlexec_env *env,
+    char output_values[sql_max_columns][sql_value_size],
+    unsigned short output_count)
 {
-    const row_source *source;
-    char value[sql_value_size];
     unsigned short index;
-    unsigned short output_count;
-    int field_index;
 
-    output_count = project->select_all
-        ? (unsigned short)(left_source->field_count
-            + (right_source ? right_source->field_count : 0))
-        : project->names.count;
     for (index = 0; index < output_count; index++) {
-        if (project->select_all) {
-            if (index < left_source->field_count) {
-                source = left_source;
-                field_index = (int)index;
-            } else if (right_source) {
-                source = right_source;
-                field_index = (int)(index - left_source->field_count);
-            } else {
-                sel_write_str(env, "error");
-                sel_write_nl(env);
-                return;
-            }
-        } else {
-            if (resolve_field_ref(left_source, right_source,
-                env->program->names[
-                    project->qualifiers.first + index],
-                env->program->names[
-                    project->names.first + index],
-                &source, &field_index) != 0) {
-                sel_write_str(env, "error");
-                sel_write_nl(env);
-                return;
-            }
-        }
-        trim_field_value(value, sizeof(value),
-            source->record + source->offsets[field_index],
-            source->fields[field_index].length);
         if (index > 0) {
             sel_write_str(env, " | ");
         }
-        sel_write_str(env, value);
+        sel_write_str(env, output_values[index]);
     }
     sel_write_nl(env);
+    return 0;
+}
+
+static int emit_output_values(const sqlexec_env *env,
+    const char output_types[sql_max_columns],
+    char output_values[sql_max_columns][sql_value_size],
+    unsigned short output_count)
+{
+    if (env->temp) {
+        return exec_append_output_values_to_temp(env->temp, output_values,
+            output_count);
+    }
+    if (env->collect) {
+        return exec_collect_output_values(env->collect, output_values,
+            output_types, output_count);
+    }
+    return write_output_values(env, output_values, output_count);
+}
+
+static int emit_projected_row(const sqlexec_env *env,
+    const exec_project_binding *binding, const row_source *sources)
+{
+    char output_values[sql_max_columns][sql_value_size];
+    unsigned short output_count;
+
+    if (exec_build_project_output_values_bound(binding, sources,
+        output_values, &output_count) != 0) {
+        sel_write_str(env, "error");
+        sel_write_nl(env);
+        return -1;
+    }
+    return emit_output_values(env, binding->output_types, output_values,
+        output_count);
+}
+
+static int project_has_functions(const sqlexec_project_def *project)
+{
+    unsigned short index;
+
+    for (index = 0; index < project->names.count; index++) {
+        if (project->functions[index] != sql_function_none) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int project_requires_grouping(const sqlexec_project_def *project)
+{
+    return project->has_aggregate
+        || project->group_names.count > 0;
+}
+
+static sql_truth_value having_node_matches(const sqlexec_env *env,
+    const exec_project_binding *binding, unsigned char ref,
+    char output_values[sql_max_columns][sql_value_size],
+    const sql_predicate_subquery_cache *subqueries)
+{
+    const sql_where_node *having_nodes;
+    const sql_predicate_operand *having_values;
+    const sql_where_node *node;
+    const sql_predicate_operand *operand;
+    const sql_predicate_subquery_result *subquery_result;
+    int output_index;
+    int right_index;
+    sql_truth_value truth;
+    int saw_unknown;
+    unsigned short value_index;
+
+    having_nodes = program_having_nodes(env->program);
+    having_values = program_having_values(env->program);
+    node = &having_nodes[ref];
+    switch (node->type) {
+    case sql_where_false:
+        return sql_truth_false;
+    case sql_where_compare:
+        output_index = binding->having_left_output[ref];
+        if (output_index < 0) {
+            return 0;
+        }
+        operand = &having_values[node->value_first];
+        if (operand->kind == sql_predicate_operand_column) {
+            right_index = binding->having_value_output[node->value_first];
+            if (right_index >= 0) {
+                return compare_text_values_truth(
+                    output_values[output_index],
+                    binding->output_types[output_index],
+                    output_values[right_index],
+                    binding->output_types[right_index],
+                    node->operator);
+            }
+            return sql_truth_false;
+        }
+        return field_matches_value_truth(output_values[output_index],
+            binding->output_types[output_index], &operand->data.value,
+            node->operator);
+    case sql_where_in:
+        output_index = binding->having_left_output[ref];
+        if (output_index < 0) {
+            return 0;
+        }
+        saw_unknown = 0;
+        for (right_index = 0; right_index < node->value_count; right_index++) {
+            operand = &having_values[node->value_first
+                + right_index];
+            if (operand->kind == sql_predicate_operand_column) {
+                value_index = (unsigned short)
+                    binding->having_value_output[node->value_first
+                        + right_index];
+                if (value_index >= binding->output_count) {
+                    return sql_truth_false;
+                }
+                truth = compare_text_values_truth(
+                    output_values[output_index],
+                    binding->output_types[output_index],
+                    output_values[value_index],
+                    binding->output_types[value_index],
+                    sql_compare_equal);
+            } else {
+                truth = field_matches_value_truth(output_values[output_index],
+                    binding->output_types[output_index],
+                    &operand->data.value, sql_compare_equal);
+            }
+            if (truth == sql_truth_true) {
+                return sql_truth_true;
+            }
+            if (truth == sql_truth_unknown) {
+                saw_unknown = 1;
+            }
+        }
+        return saw_unknown ? sql_truth_unknown : sql_truth_false;
+    case sql_where_like:
+        output_index = binding->having_left_output[ref];
+        if (output_index < 0) {
+            return sql_truth_false;
+        }
+        operand = &having_values[node->value_first];
+        if (operand->kind == sql_predicate_operand_column) {
+            value_index = (unsigned short)
+                binding->having_value_output[node->value_first];
+            if (value_index >= binding->output_count
+                || output_values[output_index][0] == '\0'
+                || output_values[value_index][0] == '\0') {
+                return sql_truth_unknown;
+            }
+            return text_matches_like_text_truth(
+                output_values[output_index],
+                output_values[value_index]);
+        }
+        return text_matches_like_truth(output_values[output_index],
+            &operand->data.value);
+    case sql_where_is_null:
+        output_index = binding->having_left_output[ref];
+        if (output_index < 0) {
+            return sql_truth_false;
+        }
+        if (node->operator == sql_compare_not_equal) {
+            return output_values[output_index][0] == '\0'
+                ? sql_truth_false : sql_truth_true;
+        }
+        return output_values[output_index][0] == '\0'
+            ? sql_truth_true : sql_truth_false;
+    case sql_where_quantified:
+        output_index = binding->having_left_output[ref];
+        if (output_index < 0 || !subqueries
+            || node->subquery_index >= subqueries->count) {
+            return sql_truth_false;
+        }
+        subquery_result = &subqueries->results[node->subquery_index];
+        if (node->quantifier == sql_quantifier_any
+            && subquery_result->row_count == 0) {
+            return sql_truth_false;
+        }
+        if (node->quantifier == sql_quantifier_all
+            && subquery_result->row_count == 0) {
+            return sql_truth_true;
+        }
+        saw_unknown = 0;
+        for (value_index = 0; value_index < subquery_result->row_count;
+            value_index++) {
+            truth = field_matches_value_truth(output_values[output_index],
+                binding->output_types[output_index],
+                &subquery_result->values[value_index], node->operator);
+            if (node->quantifier == sql_quantifier_any) {
+                if (truth == sql_truth_true) {
+                    return sql_truth_true;
+                }
+            } else if (truth == sql_truth_false) {
+                return sql_truth_false;
+            }
+            if (truth == sql_truth_unknown) {
+                saw_unknown = 1;
+            }
+        }
+        if (saw_unknown) {
+            return sql_truth_unknown;
+        }
+        return node->quantifier == sql_quantifier_any
+            ? sql_truth_false : sql_truth_true;
+    case sql_where_exists:
+        if (!subqueries || node->subquery_index >= subqueries->count) {
+            return sql_truth_false;
+        }
+        return subqueries->results[node->subquery_index].row_count > 0
+            ? sql_truth_true : sql_truth_false;
+    case sql_where_not:
+        return truth_not_value(having_node_matches(env, binding,
+            node->left, output_values, subqueries));
+    case sql_where_and:
+        return truth_and_value(
+            having_node_matches(env, binding, node->left,
+                output_values, subqueries),
+            having_node_matches(env, binding, node->right,
+                output_values, subqueries));
+    case sql_where_or:
+        return truth_or_value(
+            having_node_matches(env, binding, node->left,
+                output_values, subqueries),
+            having_node_matches(env, binding, node->right,
+                output_values, subqueries));
+    default:
+        return sql_truth_false;
+    }
+}
+
+static int having_matches_output(const sqlexec_env *env,
+    const exec_project_binding *binding,
+    char output_values[sql_max_columns][sql_value_size],
+    const sql_predicate_subquery_cache *subqueries)
+{
+    if (!env->program->having.active) {
+        return 1;
+    }
+    return having_node_matches(env, binding, env->program->having.root,
+        output_values, subqueries)
+        == sql_truth_true;
+}
+
+typedef struct select_group {
+    unsigned char used;
+    char key_values[sql_max_columns][sql_value_size];
+    char min_values[sql_max_columns][sql_value_size];
+    char max_values[sql_max_columns][sql_value_size];
+    long accum_values[sql_max_columns];
+    unsigned short count_values[sql_max_columns];
+    unsigned short avg_counts[sql_max_columns];
+    unsigned char min_seen[sql_max_columns];
+    unsigned char max_seen[sql_max_columns];
+    unsigned char sum_seen[sql_max_columns];
+} select_group;
+
+static int extract_group_key_values(const exec_project_binding *binding,
+    const row_source *sources,
+    char key_values[sql_max_columns][sql_value_size])
+{
+    unsigned short index;
+    const row_source *source;
+    unsigned char field_index;
+
+    for (index = 0; index < binding->group_count; index++) {
+        if (binding->groups[index].source_index == 0xffu
+            || binding->groups[index].field_index == 0xffu) {
+            return -1;
+        }
+        source = &sources[binding->groups[index].source_index];
+        field_index = binding->groups[index].field_index;
+        trim_field_value(key_values[index], sql_value_size,
+            source->record + source->offsets[field_index],
+            source->fields[field_index].length);
+    }
+    return 0;
+}
+
+static int extract_bound_input_value(const exec_bound_field *field,
+    char input_type, const row_source *sources,
+    char value_out[sql_value_size], char *type_out)
+{
+    const row_source *source;
+
+    if (field->source_index == 0xffu || field->field_index == 0xffu) {
+        return -1;
+    }
+    source = &sources[field->source_index];
+    if (field->field_index >= source->field_count) {
+        return -1;
+    }
+    trim_field_value(value_out, sql_value_size,
+        source->record + source->offsets[field->field_index],
+        source->fields[field->field_index].length);
+    *type_out = input_type;
+    return 0;
+}
+
+static int select_greater_than(const char *left, char type,
+    const char *right)
+{
+    return compare_text_values_truth(left, type, right, type,
+        sql_compare_greater) == sql_truth_true;
+}
+
+static int select_less_than(const char *left, char type, const char *right)
+{
+    return compare_text_values_truth(left, type, right, type,
+        sql_compare_less) == sql_truth_true;
+}
+
+static int find_or_create_group(const exec_project_binding *binding,
+    const row_source *sources,
+    select_group groups[sql_max_groups])
+{
+    char key_values[sql_max_columns][sql_value_size];
+    unsigned short group_index;
+    unsigned short key_index;
+    int same;
+
+    if (binding->group_count == 0) {
+        if (!groups[0].used) {
+            memset(&groups[0], 0, sizeof(groups[0]));
+            groups[0].used = 1;
+        }
+        return 0;
+    }
+
+    if (extract_group_key_values(binding, sources, key_values) != 0) {
+        return -1;
+    }
+
+    for (group_index = 0; group_index < sql_max_groups; group_index++) {
+        if (!groups[group_index].used) {
+            continue;
+        }
+        same = 1;
+        for (key_index = 0; key_index < binding->group_count;
+            key_index++) {
+            if (strcmp(groups[group_index].key_values[key_index],
+                key_values[key_index]) != 0) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) {
+            return (int)group_index;
+        }
+    }
+
+    for (group_index = 0; group_index < sql_max_groups; group_index++) {
+        if (!groups[group_index].used) {
+            memset(&groups[group_index], 0, sizeof(groups[group_index]));
+            groups[group_index].used = 1;
+            for (key_index = 0; key_index < binding->group_count;
+                key_index++) {
+                exec_copy_value_text(
+                    groups[group_index].key_values[key_index],
+                    key_values[key_index]);
+            }
+            return (int)group_index;
+        }
+    }
+
+    return -1;
+}
+
+static int update_group_from_row(const exec_project_binding *binding,
+    const row_source *sources, select_group *group)
+{
+    const exec_group_aggregate *aggregate;
+    char value[sql_value_size];
+    char value_type;
+    unsigned short aggregate_index;
+    unsigned char output_index;
+    int ok;
+    long number;
+
+    for (aggregate_index = 0;
+        aggregate_index < binding->aggregate_count; aggregate_index++) {
+        aggregate = &binding->aggregates[aggregate_index];
+        output_index = aggregate->output_index;
+        if (aggregate->kind == exec_group_output_count) {
+            group->count_values[output_index]++;
+            continue;
+        }
+        if (extract_bound_input_value(&aggregate->input,
+            aggregate->input_type, sources, value, &value_type) != 0) {
+            return -1;
+        }
+        if (aggregate->kind == exec_group_output_min) {
+            if (!group->min_seen[output_index]
+                || select_less_than(value, value_type,
+                    group->min_values[output_index])) {
+                exec_copy_value_text(group->min_values[output_index], value);
+                group->min_seen[output_index] = 1;
+            }
+            continue;
+        }
+        if (aggregate->kind == exec_group_output_max) {
+            if (!group->max_seen[output_index]
+                || select_greater_than(value, value_type,
+                    group->max_values[output_index])) {
+                exec_copy_value_text(group->max_values[output_index], value);
+                group->max_seen[output_index] = 1;
+            }
+            continue;
+        }
+        number = parse_integer_text(value, &ok);
+        if (!ok) {
+            return -1;
+        }
+        if (aggregate->kind == exec_group_output_sum) {
+            group->accum_values[output_index] += number;
+            group->sum_seen[output_index] = 1;
+            continue;
+        }
+        if (aggregate->kind != exec_group_output_avg) {
+            return -1;
+        }
+        group->accum_values[output_index] += number;
+        group->avg_counts[output_index]++;
+    }
+    return 0;
+}
+
+static int build_group_output_values(const exec_project_binding *binding,
+    const select_group *group,
+    char output_values[sql_max_columns][sql_value_size])
+{
+    unsigned short index;
+    int group_index;
+
+    for (index = 0; index < binding->output_count; index++) {
+        output_values[index][0] = '\0';
+        switch (binding->group_output_kinds[index]) {
+        case exec_group_output_key:
+            group_index = binding->group_output_slots[index];
+            if (group_index < 0) {
+                return -1;
+            }
+            exec_copy_value_text(output_values[index],
+                group->key_values[group_index]);
+            break;
+        case exec_group_output_count:
+            long_to_text((long)group->count_values[index], output_values[index]);
+            break;
+        case exec_group_output_min:
+            if (!group->min_seen[index]) {
+                output_values[index][0] = '\0';
+                break;
+            }
+            exec_copy_value_text(output_values[index],
+                group->min_values[index]);
+            break;
+        case exec_group_output_max:
+            if (!group->max_seen[index]) {
+                output_values[index][0] = '\0';
+                break;
+            }
+            exec_copy_value_text(output_values[index],
+                group->max_values[index]);
+            break;
+        case exec_group_output_sum:
+            if (!group->sum_seen[index]) {
+                output_values[index][0] = '\0';
+                break;
+            }
+            long_to_text(group->accum_values[index], output_values[index]);
+            break;
+        case exec_group_output_avg:
+            if (group->avg_counts[index] == 0) {
+                output_values[index][0] = '\0';
+                break;
+            }
+            long_to_text(group->accum_values[index]
+                / (long)group->avg_counts[index], output_values[index]);
+            break;
+        default:
+            return -1;
+        }
+    }
+    return 0;
+}
+
+typedef struct select_distinct_row {
+    unsigned char used;
+    char values[sql_max_columns][sql_value_size];
+} select_distinct_row;
+
+static int output_rows_equal(
+    char left[sql_max_columns][sql_value_size],
+    char right[sql_max_columns][sql_value_size], unsigned short output_count)
+{
+    unsigned short index;
+
+    for (index = 0; index < output_count; index++) {
+        if (strcmp(left[index], right[index]) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int distinct_row_is_new(
+    select_distinct_row seen_rows[sql_max_groups],
+    char output_values[sql_max_columns][sql_value_size],
+    unsigned short output_count)
+{
+    unsigned short row_index;
+    unsigned short value_index;
+
+    for (row_index = 0; row_index < sql_max_groups; row_index++) {
+        if (!seen_rows[row_index].used) {
+            continue;
+        }
+        if (output_rows_equal(seen_rows[row_index].values, output_values,
+            output_count)) {
+            return 0;
+        }
+    }
+
+    for (row_index = 0; row_index < sql_max_groups; row_index++) {
+        if (!seen_rows[row_index].used) {
+            seen_rows[row_index].used = 1;
+            for (value_index = 0; value_index < output_count; value_index++) {
+                exec_copy_value_text(seen_rows[row_index].values[value_index],
+                    output_values[value_index]);
+            }
+            return 1;
+        }
+    }
+
+    return -1;
+}
+
+static int where_terms_match_depth(const sqlexec_env *env,
+    const sql_where *where, const row_source *sources,
+    const where_binding *where_binding, unsigned char source_count,
+    const where_term *terms,
+    unsigned char term_count, unsigned char depth,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    unsigned char index;
+
+    for (index = 0; index < term_count; index++) {
+        if (terms[index].ready_depth != depth) {
+            continue;
+        }
+        if (!where_matches_ref_bound_n(env->program, where,
+            terms[index].ref, where_binding, sources, subqueries)) {
+            return 0;
+        }
+    }
+    (void)source_count;
+    return 1;
+}
+
+static int accumulate_group_row(const sqlexec_env *env,
+    const exec_project_binding *binding,
+    const sql_where *where, const where_binding *where_binding,
+    const row_source *sources,
+    unsigned char source_count,
+    select_group groups[sql_max_groups],
+    const sql_predicate_subquery_cache *subqueries)
+{
+    int group_index;
+
+    if (!where_matches_bound_n(env->program, where, where_binding, sources,
+        subqueries)) {
+        return 0;
+    }
+    group_index = find_or_create_group(binding, sources, groups);
+    if (group_index < 0) {
+        return -1;
+    }
+    (void)source_count;
+    return update_group_from_row(binding, sources, &groups[group_index]);
+}
+
+static int scan_group_rows(const sqlexec_env *env,
+    const exec_project_binding *binding,
+    const sql_where *where, const where_binding *where_binding,
+    dbf_file *files, row_source *sources, unsigned char source_count,
+    char records[sql_max_sources][table_record_size], unsigned char depth,
+    select_group groups[sql_max_groups],
+    const where_term *where_terms, unsigned char where_term_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    unsigned long index;
+    int state;
+
+    for (index = 0; index < files[depth].record_count; index++) {
+        state = dbf_read(&files[depth], index, records[depth]);
+        if (state < 0) {
+            return -1;
+        }
+        if (state == 1) {
+            continue;
+        }
+        if (!where_terms_match_depth(env, where, sources, where_binding,
+            source_count, where_terms, where_term_count, depth,
+            subqueries)) {
+            continue;
+        }
+        if (depth + 1u == source_count) {
+            if (accumulate_group_row(env, binding, where,
+                where_binding, sources, source_count, groups,
+                subqueries) != 0) {
+                return -1;
+            }
+        } else if (scan_group_rows(env, binding, where,
+            where_binding, files, sources, source_count, records,
+            (unsigned char)(depth + 1u), groups, where_terms,
+            where_term_count, subqueries) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int emit_grouped_rows(const sqlexec_env *env,
+    const exec_project_binding *binding, const sqlexec_project_def *project,
+    const sql_where *where, const where_binding *where_binding,
+    dbf_file *files, row_source *sources, unsigned char source_count,
+    char records[sql_max_sources][table_record_size],
+    const where_term *where_terms, unsigned char where_term_count,
+    unsigned short *row_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    select_group groups[sql_max_groups];
+    select_distinct_row seen_rows[sql_max_groups];
+    char output_values[sql_max_columns][sql_value_size];
+    unsigned short group_index;
+
+    memset(groups, 0, sizeof(groups));
+    memset(seen_rows, 0, sizeof(seen_rows));
+    if (scan_group_rows(env, binding, where, where_binding, files,
+        sources, source_count, records, 0, groups, where_terms,
+        where_term_count, subqueries) != 0) {
+        return -1;
+    }
+    if (!groups[0].used && project->has_aggregate
+        && project->group_names.count == 0) {
+        groups[0].used = 1;
+    }
+
+    *row_count = 0;
+    for (group_index = 0; group_index < sql_max_groups; group_index++) {
+        if (!groups[group_index].used) {
+            continue;
+        }
+        if (build_group_output_values(binding, &groups[group_index],
+            output_values) != 0) {
+            return -1;
+        }
+        if (!having_matches_output(env, binding, output_values,
+            subqueries)) {
+            continue;
+        }
+        if (project->distinct) {
+            int distinct_state = distinct_row_is_new(seen_rows, output_values,
+                binding->output_count);
+            if (distinct_state < 0) {
+                return -1;
+            }
+            if (!distinct_state) {
+                continue;
+            }
+        }
+        if (emit_output_values(env, binding->output_types, output_values,
+            binding->output_count) != 0) {
+            return -1;
+        }
+        (*row_count)++;
+    }
+
+    return 0;
+}
+
+static int emit_distinct_match(const sqlexec_env *env,
+    const exec_project_binding *binding, const sql_where *where,
+    const where_binding *where_binding,
+    const row_source *sources, unsigned char source_count,
+    select_distinct_row seen_rows[sql_max_groups],
+    unsigned short *row_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    char output_values[sql_max_columns][sql_value_size];
+    unsigned short output_count;
+    int distinct_state;
+
+    if (!where_matches_bound_n(env->program, where, where_binding, sources,
+        subqueries)) {
+        return 0;
+    }
+    if (exec_build_project_output_values_bound(binding, sources,
+        output_values, &output_count) != 0) {
+        return -1;
+    }
+    distinct_state = distinct_row_is_new(seen_rows, output_values,
+        output_count);
+    if (distinct_state < 0) {
+        return -1;
+    }
+    if (!distinct_state) {
+        return 0;
+    }
+    (void)source_count;
+    if (emit_projected_row(env, binding, sources) != 0) {
+        return -1;
+    }
+    (*row_count)++;
+    return 0;
+}
+
+static int scan_distinct_rows(const sqlexec_env *env,
+    const exec_project_binding *binding, const sql_where *where,
+    const where_binding *where_binding,
+    dbf_file *files, row_source *sources, unsigned char source_count,
+    char records[sql_max_sources][table_record_size], unsigned char depth,
+    select_distinct_row seen_rows[sql_max_groups], unsigned short *row_count,
+    const where_term *where_terms, unsigned char where_term_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    unsigned long index;
+    int state;
+
+    for (index = 0; index < files[depth].record_count; index++) {
+        state = dbf_read(&files[depth], index, records[depth]);
+        if (state < 0) {
+            return -1;
+        }
+        if (state == 1) {
+            continue;
+        }
+        if (!where_terms_match_depth(env, where, sources, where_binding,
+            source_count, where_terms, where_term_count, depth,
+            subqueries)) {
+            continue;
+        }
+        if (depth + 1u == source_count) {
+            if (emit_distinct_match(env, binding, where, where_binding,
+                sources,
+                source_count, seen_rows, row_count, subqueries) != 0) {
+                return -1;
+            }
+        } else if (scan_distinct_rows(env, binding, where, where_binding,
+            files, sources, source_count, records,
+            (unsigned char)(depth + 1u), seen_rows, row_count, where_terms,
+            where_term_count, subqueries) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int emit_distinct_rows(const sqlexec_env *env,
+    const exec_project_binding *binding, const sql_where *where,
+    const where_binding *where_binding,
+    dbf_file *files, row_source *sources, unsigned char source_count,
+    char records[sql_max_sources][table_record_size],
+    const where_term *where_terms, unsigned char where_term_count,
+    unsigned short *row_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    select_distinct_row seen_rows[sql_max_groups];
+
+    memset(seen_rows, 0, sizeof(seen_rows));
+    *row_count = 0;
+    return scan_distinct_rows(env, binding, where, where_binding, files,
+        sources, source_count, records, 0, seen_rows, row_count,
+        where_terms, where_term_count, subqueries);
+}
+
+static int emit_matching_row(const sqlexec_env *env,
+    const exec_project_binding *binding, int count_only,
+    const sql_where *where, const where_binding *where_binding,
+    const row_source *sources,
+    unsigned char source_count, unsigned short *row_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    if (!where_matches_bound_n(env->program, where, where_binding, sources,
+        subqueries)) {
+        return 0;
+    }
+    if (!count_only) {
+        if (emit_projected_row(env, binding, sources) != 0) {
+            return -1;
+        }
+    }
+    (void)source_count;
+    (*row_count)++;
+    return 0;
+}
+
+static int scan_join_rows(const sqlexec_env *env,
+    const exec_project_binding *binding, int count_only,
+    const sql_where *where, const where_binding *where_binding,
+    dbf_file *files,
+    row_source *sources, unsigned char source_count,
+    char records[sql_max_sources][table_record_size], unsigned char depth,
+    unsigned short *row_count,
+    const where_term *where_terms, unsigned char where_term_count,
+    const sql_predicate_subquery_cache *subqueries)
+{
+    unsigned long index;
+    int state;
+
+    for (index = 0; index < files[depth].record_count; index++) {
+        state = dbf_read(&files[depth], index, records[depth]);
+        if (state < 0) {
+            return -1;
+        }
+        if (state == 1) {
+            continue;
+        }
+        if (!where_terms_match_depth(env, where, sources, where_binding,
+            source_count, where_terms, where_term_count, depth,
+            subqueries)) {
+            continue;
+        }
+        if (depth + 1u == source_count) {
+            if (emit_matching_row(env, binding, count_only, where,
+                where_binding, sources, source_count, row_count,
+                subqueries) != 0) {
+                return -1;
+            }
+        } else if (scan_join_rows(env, binding, count_only, where,
+            where_binding, files, sources, source_count,
+            records, (unsigned char)(depth + 1u), row_count, where_terms,
+            where_term_count, subqueries) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int close_sources(dbf_file *files, unsigned char count)
+{
+    unsigned char index;
+
+    for (index = count; index > 0; index--) {
+        if (dbf_close(&files[index - 1u]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -104,299 +948,207 @@ static void write_projected_row(const sqlexec_env *env,
 /* ------------------------------------------------------------------ */
 
 int exec_select(sqlexec_env *env, const char *table_name,
-    sqlexec_ref emit_ref)
+    sqlexec_ref plan_ref)
 {
-    const sqlexec_node *emit_node;
+    const sqlexec_node *plan_node;
     const sqlexec_node *project_node;
     const sqlexec_node *scan_node;
-    dbf_file file;
-    dbf_file right_file;
-    dbf_field fields[sql_max_columns];
-    dbf_field right_fields[sql_max_columns];
-    unsigned short offsets[sql_max_columns];
-    unsigned short right_offsets[sql_max_columns];
-    char record[table_record_size];
-    char right_record[table_record_size];
+    const sqlexec_join_def *join_def;
+    dbf_file files[sql_max_sources];
+    dbf_field source_fields[sql_max_sources][sql_max_columns];
+    unsigned short source_offsets[sql_max_sources][sql_max_columns];
+    char source_records[sql_max_sources][table_record_size];
     sql_where where;
-    row_source left_source;
-    row_source right_source;
-    unsigned long index;
-    unsigned long right_index;
+    row_source sources[sql_max_sources];
+    where_binding where_binding_storage;
+    const where_binding *where_binding;
+    where_term where_terms[sql_where_max_nodes];
     unsigned short row_count;
-    unsigned short output_count;
-    unsigned short select_index;
     sqlexec_ref scan_ref;
     sqlexec_ref child_ref;
-    const row_source *resolved_source;
-    int state;
-    int right_state;
-    int field_index;
-    int right_opened;
-    ndx_file ndx;
+    unsigned char source_count;
+    unsigned char source_index;
+    unsigned char opened_source_count;
+    unsigned char where_term_count;
+    exec_project_binding binding;
     exec_index_scan_ctx scan_ctx;
-    int scan_result;
+    sql_predicate_subquery_cache predicate_subqueries;
+    int count_only;
+    int grouped_select;
+    int special_projection;
 
-    emit_node = sqlexec_get_const(env->program, emit_ref);
-    if (!emit_node) {
+    plan_node = sqlexec_get_const(env->program, plan_ref);
+    if (!plan_node) {
         return -1;
     }
-    right_opened = 0;
-    if (open_table_file(env->root, env->current_db, table_name, &file,
-        fields, offsets) != 0) {
+    memset(files, 0, sizeof(files));
+    memset(sources, 0, sizeof(sources));
+    memset(where_terms, 0, sizeof(where_terms));
+    memset(&predicate_subqueries, 0, sizeof(predicate_subqueries));
+    source_count = 1;
+    opened_source_count = 0;
+    where_term_count = 0;
+    where_binding = NULL;
+
+    if (open_table_file(env->root, env->current_db, table_name, &files[0],
+        source_fields[0], source_offsets[0]) != 0) {
         return -1;
     }
+    opened_source_count = 1;
 
-    if (emit_node->opcode == sqlexec_emit_rows) {
-        child_ref = child_at(env->program, emit_ref, 0);
-        project_node = sqlexec_get_const(env->program, child_ref);
-        if (!project_node
-            || project_node->opcode != sqlexec_project) {
-            dbf_close(&file);
-            return -1;
-        }
-        if (resolve_scan_node(env->program,
-            child_at(env->program, child_ref, 0),
+    count_only = plan_node->opcode != sqlexec_project;
+    if (!count_only) {
+        project_node = plan_node;
+        child_ref = child_at(env->program, plan_ref, 0);
+        if (resolve_scan_node(env->program, child_ref,
             &where, &scan_ref) != 0) {
-            dbf_close(&file);
+            close_sources(files, opened_source_count);
             return -1;
         }
-    } else if (emit_node->opcode == sqlexec_emit_count) {
-        child_ref = child_at(env->program, emit_ref, 0);
-        if (child_ref == sqlexec_nil
-            || env->program->nodes[child_ref].opcode
-                != sqlexec_count_rows
-            || resolve_scan_node(env->program,
-                child_at(env->program, child_ref, 0),
-                &where, &scan_ref) != 0) {
-            dbf_close(&file);
+    } else {
+        if (resolve_scan_node(env->program, plan_ref, &where,
+            &scan_ref) != 0) {
+            close_sources(files, opened_source_count);
             return -1;
         }
         project_node = NULL;
-    } else {
-        dbf_close(&file);
-        return -1;
     }
 
     scan_node = sqlexec_get_const(env->program, scan_ref);
     if (!scan_node || scan_ref == sqlexec_nil) {
-        dbf_close(&file);
+        close_sources(files, opened_source_count);
         return -1;
     }
 
-    left_source.table_name = table_name;
-    left_source.alias = "";
-    left_source.fields = fields;
-    left_source.offsets = offsets;
-    left_source.record = record;
-    left_source.field_count = file.field_count;
-    right_source.table_name = NULL;
-    right_source.alias = NULL;
-    right_source.fields = NULL;
-    right_source.offsets = NULL;
-    right_source.record = right_record;
-    right_source.field_count = 0;
+    sources[0].table_name = table_name;
+    sources[0].alias = "";
+    sources[0].fields = source_fields[0];
+    sources[0].offsets = source_offsets[0];
+    sources[0].record = source_records[0];
+    sources[0].field_count = files[0].field_count;
+    join_def = NULL;
     if (scan_node->opcode == sqlexec_join_scan) {
-        const sqlexec_join_def *j = &scan_node->data.join;
-        left_source.table_name  = join_left_table(env->program, *j);
-        left_source.alias       = join_left_alias(env->program, *j);
-        if (open_table_file(env->root, env->current_db,
-            join_right_table(env->program, *j), &right_file,
-            right_fields, right_offsets) != 0) {
-            dbf_close(&file);
+        join_def = &scan_node->data.join;
+        source_count = join_source_count(*join_def);
+        if (source_count < 2 || source_count > sql_max_sources) {
+            close_sources(files, opened_source_count);
             return -1;
         }
-        right_opened = 1;
-        right_source.table_name  = join_right_table(env->program, *j);
-        right_source.alias       = join_right_alias(env->program, *j);
-        right_source.fields      = right_fields;
-        right_source.offsets     = right_offsets;
-        right_source.field_count = right_file.field_count;
-    }
-
-    if (emit_node->opcode == sqlexec_emit_rows) {
-        output_count = project_node->data.project.select_all
-            ? (unsigned short)(left_source.field_count
-                + (right_opened ? right_source.field_count : 0))
-            : project_node->data.project.names.count;
-        for (select_index = 0; select_index < output_count;
-            select_index++) {
-            if (project_node->data.project.select_all) {
-                continue;
-            }
-            if (resolve_field_ref(&left_source,
-                right_opened ? &right_source : NULL,
-                env->program->names[
-                    project_node->data.project.qualifiers.first
-                        + select_index],
-                env->program->names[
-                    project_node->data.project.names.first
-                        + select_index],
-                &resolved_source, &field_index) != 0) {
-                if (right_opened) {
-                    dbf_close(&right_file);
-                }
-                dbf_close(&file);
+        sources[0].table_name = join_table_at(env->program, *join_def, 0);
+        sources[0].alias = join_alias_at(env->program, *join_def, 0);
+        for (source_index = 1; source_index < source_count; source_index++) {
+            if (open_table_file(env->root, env->current_db,
+                join_table_at(env->program, *join_def, source_index),
+                &files[source_index], source_fields[source_index],
+                source_offsets[source_index]) != 0) {
+                close_sources(files, opened_source_count);
                 return -1;
             }
+            opened_source_count++;
+            sources[source_index].table_name = join_table_at(env->program,
+                *join_def, source_index);
+            sources[source_index].alias = join_alias_at(env->program,
+                *join_def, source_index);
+            sources[source_index].fields = source_fields[source_index];
+            sources[source_index].offsets = source_offsets[source_index];
+            sources[source_index].record = source_records[source_index];
+            sources[source_index].field_count = files[source_index].field_count;
         }
     }
 
-    {
-        row_source chk_sources[2];
-        unsigned char chk_count = 1;
-        chk_sources[0] = left_source;
-        if (right_opened) chk_sources[chk_count++] = right_source;
-        if (!where_references_known_fields_n(env->program, &where,
-            chk_sources, chk_count)) {
-            if (right_opened) dbf_close(&right_file);
-            dbf_close(&file);
+    if (where_is_constant_false(&where, env->program->where_nodes)) {
+        if (close_sources(files, opened_source_count) != 0) {
             return -1;
         }
+        sel_write_uint(env, 0);
+        if (!count_only) {
+            sel_write_str(env, " rows");
+        }
+        sel_write_nl(env);
+        return 0;
     }
+
+    if (env->program->predicate_subquery_count > 0
+        && load_predicate_subqueries(env, &predicate_subqueries) != 0) {
+        close_sources(files, opened_source_count);
+        return -1;
+    }
+
+    if (!count_only
+        && exec_bind_project(env->program, &project_node->data.project,
+            sources, source_count, &binding) != 0) {
+        close_sources(files, opened_source_count);
+        return -1;
+    }
+    if (!where_can_use_program_binding(env->program, &where)) {
+        if (where_bind_n(env->program, &where, sources, source_count,
+            &where_binding_storage) != 0) {
+            close_sources(files, opened_source_count);
+            return -1;
+        }
+        where_binding = &where_binding_storage;
+    }
+    if (where_split_conjuncts_bound(env->program, &where, where_binding,
+        where_terms, &where_term_count) != 0) {
+        close_sources(files, opened_source_count);
+        return -1;
+    }
+    grouped_select = !count_only
+        && project_requires_grouping(&project_node->data.project);
+    special_projection = !count_only
+        && (project_has_functions(&project_node->data.project)
+            || project_node->data.project.distinct);
 
     row_count = 0;
-    if (!right_opened
-        && scan_node->opcode != sqlexec_table_scan) {
-        /* Index scan: use NDX to drive record retrieval. */
-        if (open_ndx(env, scan_node->opcode == sqlexec_index_scan_eq
-            ? scan_node->data.index_probe.index_name
-            : scan_node->data.index_range.index_name, &ndx) != 0) {
-            dbf_close(&file);
+    if (grouped_select) {
+        if (emit_grouped_rows(env, &binding, &project_node->data.project,
+            &where, where_binding, files, sources, source_count,
+            source_records, where_terms, where_term_count, &row_count,
+            &predicate_subqueries) != 0) {
+            close_sources(files, opened_source_count);
             return -1;
         }
+    } else if (!count_only && project_node->data.project.distinct) {
+        if (emit_distinct_rows(env, &binding, &where, where_binding, files,
+            sources, source_count, source_records, where_terms,
+            where_term_count, &row_count, &predicate_subqueries) != 0) {
+            close_sources(files, opened_source_count);
+            return -1;
+        }
+    } else if (source_count == 1 && scan_uses_index(scan_node)
+        && !special_projection) {
+        /* Index scan: use NDX to drive record retrieval. */
         memset(&scan_ctx, 0, sizeof(scan_ctx));
-        scan_ctx.ndx = &ndx;
-        scan_ctx.file = &file;
-        scan_ctx.fields = fields;
-        scan_ctx.offsets = offsets;
-        scan_ctx.record = record;
-        scan_ctx.source = &left_source;
+        scan_ctx.file = &files[0];
+        scan_ctx.fields = source_fields[0];
+        scan_ctx.offsets = source_offsets[0];
+        scan_ctx.record = source_records[0];
+        scan_ctx.source = &sources[0];
         scan_ctx.env = env;
         scan_ctx.where = &where;
+        scan_ctx.where_binding = where_binding;
         scan_ctx.action = exec_scan_select;
-        scan_ctx.project = project_node
-            ? &project_node->data.project : NULL;
-        scan_ctx.count_only =
-            (emit_node->opcode == sqlexec_emit_count);
+        scan_ctx.binding = &binding;
+        scan_ctx.count_only = count_only;
         scan_ctx.row_count = &row_count;
-
-        if (scan_node->opcode == sqlexec_index_scan_eq) {
-            if (build_eq_key(&ndx,
-                &scan_node->data.index_probe.value,
-                scan_ctx.eq_key) != 0) {
-                ndx_close(&ndx);
-                dbf_close(&file);
-                return -1;
-            }
-            scan_result = ndx_scan(&ndx, exec_eq_scan_callback,
-                &scan_ctx);
-        } else {
-            if (scan_node->data.index_range.lower_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_lower = 1;
-                scan_ctx.lower_incl =
-                    scan_node->data.index_range.lower_operator
-                    == sql_compare_greater_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.lower_value,
-                    scan_ctx.lower_key);
-            }
-            if (scan_node->data.index_range.upper_operator
-                != sql_compare_invalid) {
-                scan_ctx.has_upper = 1;
-                scan_ctx.upper_incl =
-                    scan_node->data.index_range.upper_operator
-                    == sql_compare_less_equal;
-                build_bound_key(&ndx,
-                    &scan_node->data.index_range.upper_value,
-                    scan_ctx.upper_key);
-            }
-            scan_result = ndx_scan(&ndx, exec_range_scan_callback,
-                &scan_ctx);
-        }
-
-        ndx_close(&ndx);
-        if (scan_ctx.failed || scan_result < 0) {
-            dbf_close(&file);
+        scan_ctx.subqueries = &predicate_subqueries;
+        if (exec_run_index_scan(env, scan_node, &scan_ctx) != 0) {
+            close_sources(files, opened_source_count);
             return -1;
         }
-    } else {
-        /* Table scan (also covers join scans). */
-        for (index = 0; index < file.record_count; index++) {
-            state = dbf_read(&file, index, record);
-            if (state < 0) {
-                if (right_opened) {
-                    dbf_close(&right_file);
-                }
-                dbf_close(&file);
-                return -1;
-            }
-            if (state == 1) {
-                continue;
-            }
-            if (!right_opened) {
-                if (!where_matches(env->program, &where,
-                    &left_source, NULL)) {
-                    continue;
-                }
-                if (emit_node->opcode != sqlexec_emit_count) {
-                    if (env->temp) {
-                        append_projected_to_temp(env->temp, env,
-                            &project_node->data.project,
-                            &left_source);
-                    } else {
-                        write_projected_row(env,
-                            &project_node->data.project,
-                            &left_source, NULL);
-                    }
-                }
-                row_count++;
-                continue;
-            }
-
-            for (right_index = 0;
-                right_index < right_file.record_count;
-                right_index++) {
-                right_state = dbf_read(&right_file, right_index,
-                    right_record);
-                if (right_state < 0) {
-                    dbf_close(&right_file);
-                    dbf_close(&file);
-                    return -1;
-                }
-                if (right_state == 1) {
-                    continue;
-                }
-                /* The ON condition is in the WHERE tree. Evaluate it
-                 * alongside any regular WHERE clause using N sources. */
-                {
-                    row_source join_sources[2];
-                    join_sources[0] = left_source;
-                    join_sources[1] = right_source;
-                    if (!where_matches_n(env->program, &where,
-                        join_sources, 2)) {
-                        continue;
-                    }
-                }
-                if (emit_node->opcode != sqlexec_emit_count) {
-                    write_projected_row(env,
-                        &project_node->data.project,
-                        &left_source, &right_source);
-                }
-                row_count++;
-            }
-        }
-    }
-    if (right_opened && dbf_close(&right_file) != 0) {
-        dbf_close(&file);
+    } else if (scan_join_rows(env, count_only ? NULL : &binding,
+        count_only, &where, where_binding, files, sources,
+        source_count, source_records, 0, &row_count, where_terms,
+        where_term_count, &predicate_subqueries) != 0) {
+        close_sources(files, opened_source_count);
         return -1;
     }
-    if (dbf_close(&file) != 0) {
+    if (close_sources(files, opened_source_count) != 0) {
         return -1;
     }
 
     sel_write_uint(env, row_count);
-    if (emit_node->opcode != sqlexec_emit_count) {
+    if (!count_only) {
         sel_write_str(env, " row");
         if (row_count != 1) {
             sel_write_char(env, 's');

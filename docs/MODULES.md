@@ -69,20 +69,23 @@ lib/
     execute_select.c   SELECT executor
     execute_mutate.c   INSERT, UPDATE, DELETE executors
     execute_scan.c     ndx_scan callbacks for index-driven scans
-    execute_subquery.c run_subquery + delete_temp + built-in views
+    execute_subquery.c temp materialisation + built-in views
     exec_impl.h  internal env struct, entry-point declarations
 ```
 
-### Shared helpers (lib/shared/)
+### Common and Catalog Helpers
 
-Code needed by more than one phase lives in `lib/shared/` so it is
-compiled once and referenced by all phases without duplication.
+Phase-neutral helpers live in `lib/common/`. Catalog and table-access
+infrastructure lives in `lib/catalog/`. Executor-only runtime support
+stays in `lib/sqlexec/` rather than leaking into parser or optimizer
+layers.
 
 | File | Contents | Used by |
 |---|---|---|
-| `shared.c` | string utils, field ops, parse_integer_text | all phases |
-| `catalog.c` | ensure_catalog, find_database_path, open_table_file, view catalog | optimizer, executor |
+| `common.c` | string utils, field ops, parse_integer_text | all phases |
+| `catalog.c` | ensure_catalog, find_database_path, open_table_file, view catalog | parser, optimizer, executor |
 | `where.c` | row_source, where_matches, resolve_field_ref | executor |
+| `metacache.c` | schema cache for USE / DDL / sys views | executor |
 
 ---
 
@@ -97,7 +100,7 @@ into a resident kernel and loadable module binaries.
 |---|---|---|
 | CP/M system (BDOS + BIOS) | ~8 KB | fixed, at top |
 | Resident kernel | ~6 KB | always present |
-| Communication area (sql_context) | ~5 KB | fixed address |
+| Communication area (sql_context) | ~5 KB target | fixed address; hosted build still measures about 11 KB after the latest shrink pass |
 | Module slot | ~8 KB | one module at a time |
 | Data / stack | ~21 KB | |
 
@@ -108,7 +111,7 @@ The kernel is always loaded and contains:
 - platform I/O (read_char / write_char)
 - DBF library
 - NDX library
-- lib/shared (all helpers)
+- lib/common + lib/catalog
 - sqlexec.c arena management
 
 Everything else loads on demand.

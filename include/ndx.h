@@ -35,6 +35,12 @@ typedef struct ndx_file {
 
 typedef int (*ndx_visit_fn)(unsigned long record_number);
 
+typedef struct ndx_scan_entry {
+    const unsigned char *key;
+    unsigned short key_length;
+    void *ctx;
+} ndx_scan_entry;
+
 /*
  * Extended scan callback that also receives the raw key bytes and a
  * caller-supplied context pointer. Used by ndx_scan to support equality
@@ -42,7 +48,7 @@ typedef int (*ndx_visit_fn)(unsigned long record_number);
  * Returning non-zero stops the walk.
  */
 typedef int (*ndx_scan_fn)(unsigned long record_number,
-    const unsigned char *key, unsigned short key_length, void *ctx);
+    const ndx_scan_entry *entry);
 
 /*
  * Creates one dBase III compatible NDX file from an open DBF table.

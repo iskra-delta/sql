@@ -27,6 +27,8 @@ statement structure.
 
 - `int sql_parse(const char *text, sqlexec_program *program, const char *root, const char *current_db);`
 - `int sql_parse_statement(const char *text, sql_statement *statement);`
+- `int sql_parse_select_body(const char *text, sql_statement *statement);`
+- `int sql_parse_select_program(const char *text, sqlexec_program *program, const char *root, const char *current_db);`
 
 `sql_parse()` is the normal public entry point. It accepts `root` and
 `current_db` for view name resolution; pass `NULL, NULL` when catalog
@@ -39,6 +41,15 @@ It:
 - looks up user view names in `sys/vw.dbf` and validates their SQL
 - returns `0` on success
 - returns `-1` on parse, view validation, or lowering failure
+
+`sql_parse_select_body()` is the low-level SELECT-body parser for
+subqueries and stored view text. It expects `SELECT ...` without a
+trailing semicolon.
+
+`sql_parse_select_program()` lowers one SELECT body directly into a
+`sqlexec_program`. The executor uses it for complex stored views,
+materialized FROM subqueries, and predicate subqueries so those paths
+do not need to wrap inner SQL in a fake top-level statement first.
 
 `sql_parse_statement()` remains available as a lower-level helper for:
 
@@ -56,16 +67,17 @@ Important payload areas:
 - `type`
 - `name`
 - `table_name`
-- `columns`
-- `create_index_unique`
-- `key_names`
-- `select_all`
-- `select_count_star`
-- `select_items`
-- `from_alias`
-- `values`
-- `assignments`
+- `detail.select` for `SELECT`-only scratch
+- `detail.variant.create_table` for `CREATE TABLE`
+- `detail.variant.create_index` for `CREATE INDEX`
+- `detail.variant.mutate` for `INSERT` and `UPDATE`
 - `where`
+- `having`
+
+For `INSERT`, plain `VALUES (...)` input now reuses `assignments` with
+empty column names instead of carrying a second separate value array.
+The `detail` union keeps those statement-specific payloads overlapped so
+the parser does not reserve all of them at once.
 
 But that structure is not the cross-phase contract anymore.
 
@@ -78,10 +90,9 @@ trees such as:
 
 - `create_database`
 - `create_table`
-- `sequence(build_index, register_index)`
-- `sequence(open_table, emit_rows(project(filter(table_scan))), close_table)`
-- `sequence(open_table, count_affected(write_current(...)),
-  rebuild_table_indexes, close_table)`
+- `create_index`
+- `project(table_scan)`
+- `write_current(...)`
 
 Keeping the parser responsible for those shapes means:
 
@@ -100,11 +111,23 @@ Keeping the parser responsible for those shapes means:
 - `CREATE [UNIQUE] INDEX name ON table (column[, column ...]);`
 - `SELECT * FROM table;`
 - `SELECT COUNT(*) FROM table [WHERE ...];`
-- `SELECT column[, column ...] FROM table [WHERE ...];`
+- `SELECT [DISTINCT] column[, column ...] FROM table [WHERE ...];`
+- `SELECT TRIM(column) FROM table [WHERE ...];`
+- `SELECT group_col, COUNT(*), COUNT(column), MIN(column), MAX(column),
+  SUM(column), AVG(column) FROM table
+  [WHERE ...] GROUP BY group_col [HAVING alias op value];`
 - `SELECT table.column [AS alias] FROM table [AS alias] [WHERE ...];`
+- `SELECT ... FROM left [AS a], right [AS b] WHERE a.col = b.col
+  [AND ...];`
 - `SELECT ... FROM left [AS a] JOIN right [AS b] ON a.col = b.col
   [WHERE ...];`
+- `SELECT ... FROM table WHERE col IS [NOT] NULL;`
+- `SELECT ... FROM table WHERE EXISTS (SELECT ...);`
+- `SELECT ... FROM table WHERE col IN (SELECT ...);`
+- `SELECT ... FROM table WHERE col op ANY (SELECT ...)
+  [OR col op ALL (SELECT ...)];`
 - `INSERT INTO table VALUES (value[, value ...]);`
+- `INSERT INTO table (column[, column ...]) VALUES (value[, value ...]);`
 - `UPDATE table SET column = value[, column = value ...] [WHERE ...];`
 - `DELETE FROM table [WHERE ...];`
 
@@ -123,19 +146,30 @@ Column types:
 - one expression tree per statement
 - `AND`
 - `OR`
+- `NOT`
 - `IN (...)`
+- `IN (SELECT ...)`
+- `BETWEEN`
+- `LIKE`
+- `IS NULL`
+- `IS NOT NULL`
+- `EXISTS (SELECT ...)`
+- quantified comparisons with `ANY` / `ALL`
 - parentheses for grouping
 - operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`
-- values: quoted strings, numbers, or identifiers
+- values: quoted strings, numbers, `NULL`, or identifiers, including
+  qualified column references in multi-source WHERE comparisons
 - column references may be qualified with the current table name or its
-  alias in `SELECT` statements, including the joined table in one
-  join query
+  alias in `SELECT` statements, including additional row sources in
+  comma-table and join queries
+- `HAVING` reuses the same boolean grammar but references projected
+  output names or aliases
 
 Not supported:
 
 - outer joins
-- more than one joined table
-- subqueries
+- more than three joined tables
+- correlated subqueries
 
 ## How It Works
 
@@ -146,8 +180,14 @@ It:
 - skips ASCII whitespace
 - matches keywords case-insensitively
 - reads identifiers and literals into fixed-size buffers
-- reads `table.column` references for `SELECT` and `WHERE`
-- parses one `JOIN ... ON left.col = right.col` clause for `SELECT`
+- recognizes `NULL` as a literal value token
+- reads `table.column` references for `SELECT`, `WHERE`, and value
+  positions used by column-to-column comparisons
+- parses bounded comma-separated table lists and `JOIN ... ON
+  left.col = right.col` chains for `SELECT`
+- parses bounded `GROUP BY` and `HAVING` clauses for grouped `SELECT`
+- captures bounded uncorrelated predicate subquery text for later
+  execution by `lib/sqlexec`
 - uses recursive-descent parsing for each statement form
 - lowers successful parses into bounded tree nodes
 
@@ -170,7 +210,7 @@ if (sql_parse_statement("CREATE UNIQUE INDEX people_name ON people (city, name);
 if (statement.type == sql_statement_create_index) {
     /* statement.name == "people_name" */
     /* statement.table_name == "people" */
-    /* statement.key_count == 2 */
+    /* index keys live in statement.variant.create_index */
 }
 ```
 
@@ -202,9 +242,9 @@ if (sql_parse_statement(
     return 1;
 }
 
-/* statement.from_alias == "p" */
-/* statement.select_items[0].column.name == "name" */
-/* statement.select_items[0].alias == "person" */
+/* statement.detail.select.from_alias == "p" */
+/* statement.detail.select.select_items[0].column.name == "name" */
+/* statement.detail.select.select_items[0].alias == "person" */
 /* statement.where.root references one compare node for name = 'alice' */
 ```
 

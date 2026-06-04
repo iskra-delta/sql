@@ -1,0 +1,15 @@
+USE employee;
+CREATE INDEX idxdepartmentdep ON department (deptno);
+CREATE INDEX idxdeptempempno ON dept_emp (empno);
+CREATE INDEX idxdeptempdeptno ON dept_emp (deptno);
+CREATE INDEX idxdeptmanagerem ON dept_manager (empno);
+CREATE INDEX idxdeptmanagerde ON dept_manager (deptno);
+CREATE INDEX idxemployeeempno ON employee (empno);
+CREATE INDEX idxemployeelastn ON employee (lastname);
+CREATE INDEX idxexpectedvalue ON expected_value (tablename);
+CREATE INDEX idxfoundvaluetab ON found_value (tablename);
+CREATE INDEX idxsalaryempno ON salary (empno);
+CREATE INDEX idxsalaryfromdat ON salary (fromdate);
+CREATE INDEX idxtitleempno ON title (empno);
+CREATE INDEX idxtitletitle ON title (title);
+CREATE INDEX idxtitlefromdate ON title (fromdate);

@@ -12,9 +12,9 @@
 
 #include "sqlexec.h"
 #include "ndx.h"
-#include "../shared/where.h"
-#include "../shared/catalog.h"
-#include "../shared/metacache.h"
+#include "where.h"
+#include "../catalog/catalog.h"
+#include "metacache.h"
 
 #include <string.h>
 
@@ -34,6 +34,55 @@ typedef struct exec_temp_ctx {
     unsigned short  field_count;
 } exec_temp_ctx;
 
+typedef unsigned char exec_collect_mode;
+enum {
+    exec_collect_values = 0,
+    exec_collect_exists
+};
+
+typedef struct exec_collect_ctx {
+    exec_collect_mode mode;
+    sql_predicate_subquery_result *result;
+} exec_collect_ctx;
+
+typedef struct exec_bound_field {
+    unsigned char source_index;
+    unsigned char field_index;
+} exec_bound_field;
+
+typedef unsigned char exec_group_output_kind;
+enum {
+    exec_group_output_invalid = 0,
+    exec_group_output_key,
+    exec_group_output_count,
+    exec_group_output_min,
+    exec_group_output_max,
+    exec_group_output_sum,
+    exec_group_output_avg
+};
+
+typedef struct exec_group_aggregate {
+    exec_group_output_kind kind;
+    unsigned char output_index;
+    exec_bound_field input;
+    char input_type;
+} exec_group_aggregate;
+
+typedef struct exec_project_binding {
+    unsigned short output_count;
+    unsigned short group_count;
+    unsigned short aggregate_count;
+    exec_bound_field outputs[sql_max_columns];
+    exec_bound_field groups[sql_max_columns];
+    exec_group_aggregate aggregates[sql_max_columns];
+    signed char group_lookup[sql_max_columns];
+    signed char group_output_slots[sql_max_columns];
+    exec_group_output_kind group_output_kinds[sql_max_columns];
+    char output_types[sql_max_columns];
+    signed char having_left_output[sql_where_max_nodes];
+    signed char having_value_output[sql_where_max_values];
+} exec_project_binding;
+
 typedef struct sqlexec_env {
     const char *root;
     const sqlexec_program *program;
@@ -41,8 +90,12 @@ typedef struct sqlexec_env {
     const sqlexec_io *io;
     /* Non-NULL only when materialising a subquery to a temp table. */
     exec_temp_ctx *temp;
+    /* Non-NULL only when collecting predicate subquery rows in memory. */
+    exec_collect_ctx *collect;
     /* Schema cache: non-NULL after USE, freed on schema change. */
     meta_cache *schema;
+    /* Shared counter for allocating unique temp files in nested work. */
+    unsigned short *temp_serial;
 } sqlexec_env;
 
 /* ------------------------------------------------------------------ */
@@ -64,8 +117,8 @@ typedef enum exec_scan_action {
 typedef struct exec_index_scan_ctx {
     /* NDX file and encoded target keys */
     ndx_file       *ndx;
-    unsigned char   eq_key[ndx_max_key_length];     /* for index_scan_eq   */
-    unsigned char   lower_key[ndx_max_key_length];  /* for index_scan_range */
+    unsigned char   eq_key[ndx_max_key_length];     /* equality access     */
+    unsigned char   lower_key[ndx_max_key_length];  /* range access        */
     unsigned char   upper_key[ndx_max_key_length];
     unsigned char   has_lower;
     unsigned char   has_upper;
@@ -80,14 +133,18 @@ typedef struct exec_index_scan_ctx {
     /* WHERE evaluation */
     const sqlexec_env      *env;
     const sql_where        *where;
+    /* May be NULL when the program carries packed WHERE bindings. */
+    const where_binding    *where_binding;
     /* Action-specific payload */
     exec_scan_action action;
     /* SELECT */
-    const sqlexec_project_def *project;
+    const exec_project_binding *binding;
     int             count_only;
     unsigned short *row_count;
+    const sql_predicate_subquery_cache *subqueries;
     /* UPDATE */
-    const sqlexec_node *apply_node;
+    const sqlexec_node *write_node;
+    const unsigned short *assignment_fields;
     unsigned short *changed_count;
     /* DELETE */
     unsigned short *deleted_count;
@@ -96,19 +153,26 @@ typedef struct exec_index_scan_ctx {
 } exec_index_scan_ctx;
 
 /*
- * ndx_scan callback for index_scan_eq.
+ * ndx_scan callback for equality access on a table_scan.
  * Stops when the current key is past the target; processes records
  * whose key exactly equals eq_key.
  */
 int exec_eq_scan_callback(unsigned long record_number,
-    const unsigned char *key, unsigned short key_length, void *vctx);
+    const ndx_scan_entry *entry);
 
 /*
- * ndx_scan callback for index_scan_range.
+ * ndx_scan callback for range access on a table_scan.
  * Skips records below the lower bound; stops when past the upper bound.
  */
 int exec_range_scan_callback(unsigned long record_number,
-    const unsigned char *key, unsigned short key_length, void *vctx);
+    const ndx_scan_entry *entry);
+
+/*
+ * Runs one index-backed scan node through the shared callback path.
+ * Returns zero on success and -1 on NDX open/build/scan failure.
+ */
+int exec_run_index_scan(const sqlexec_env *env, const sqlexec_node *scan_node,
+    exec_index_scan_ctx *ctx);
 
 /* ------------------------------------------------------------------ */
 /* Subquery execution entry points                                      */
@@ -135,24 +199,22 @@ static inline int resolve_scan_node(const sqlexec_program *program,
 {
     const sqlexec_node *node;
     if (!where || !scan_ref_out || input_ref == sqlexec_nil) return -1;
-    memset(where, 0, sizeof(*where));
+    *where = program->where;
     node = sqlexec_get_const(program, input_ref);
     if (!node) return -1;
-    if (node->opcode == sqlexec_filter) {
-        *where = node->data.where;
-        input_ref = child_at(program, input_ref, 0);
-        if (input_ref == sqlexec_nil) return -1;
-        node = sqlexec_get_const(program, input_ref);
-        if (!node) return -1;
-    }
     if (node->opcode != sqlexec_table_scan
-        && node->opcode != sqlexec_join_scan
-        && node->opcode != sqlexec_index_scan_eq
-        && node->opcode != sqlexec_index_scan_range) {
+        && node->opcode != sqlexec_join_scan) {
         return -1;
     }
     *scan_ref_out = input_ref;
     return 0;
+}
+
+static inline int scan_uses_index(const sqlexec_node *node)
+{
+    return node
+        && node->opcode == sqlexec_table_scan
+        && node->data.scan.access_kind != sqlexec_scan_full;
 }
 
 static inline int open_ndx(const sqlexec_env *env,
@@ -189,9 +251,45 @@ int dispatch_builtin_view(const sqlexec_env *env,
 int exec_run_subquery(sqlexec_env *env);
 int exec_delete_temp(sqlexec_env *env);
 
-void append_projected_to_temp(exec_temp_ctx *temp,
-    const sqlexec_env *env,
-    const sqlexec_project_def *project, const row_source *source);
+int load_predicate_subqueries(const sqlexec_env *env,
+    sql_predicate_subquery_cache *cache);
+
+unsigned short exec_project_output_count(const sqlexec_project_def *project,
+    const row_source *sources, unsigned char source_count);
+
+int exec_resolve_project_field(const sqlexec_program *program,
+    const sqlexec_project_def *project, const row_source *sources,
+    unsigned char source_count, unsigned short index,
+    const row_source **source_out, int *field_index_out);
+
+int exec_resolve_group_field(const sqlexec_program *program,
+    const sqlexec_project_def *project, const row_source *sources,
+    unsigned char source_count, unsigned short index,
+    const row_source **source_out, int *field_index_out);
+
+int exec_bind_project(const sqlexec_program *program,
+    const sqlexec_project_def *project, const row_source *sources,
+    unsigned char source_count, exec_project_binding *binding);
+
+void exec_copy_dbf_field_name(char *target, const char *source);
+
+void exec_copy_value_text(char *target, const char *source);
+
+int exec_build_project_output_values_bound(
+    const exec_project_binding *binding, const row_source *sources,
+    char output_values[sql_max_columns][sql_value_size],
+    unsigned short *output_count_out);
+
+int exec_append_output_values_to_temp(exec_temp_ctx *temp,
+    char output_values[sql_max_columns][sql_value_size],
+    unsigned short output_count);
+
+int exec_collect_output_values(exec_collect_ctx *collect,
+    char output_values[sql_max_columns][sql_value_size],
+    const char output_types[sql_max_columns], unsigned short output_count);
+
+int append_projected_to_temp_bound(exec_temp_ctx *temp,
+    const exec_project_binding *binding, const row_source *sources);
 
 /*
  * Executes a program using an already-constructed sqlexec_env.
@@ -206,15 +304,15 @@ int sqlexec_execute_env(sqlexec_env *env);
 int exec_ddl(sqlexec_env *env);
 
 int exec_select(sqlexec_env *env, const char *table_name,
-    sqlexec_ref emit_ref);
+    sqlexec_ref plan_ref);
 
 int exec_insert(sqlexec_env *env, const char *table_name,
-    sqlexec_span values);
+    sqlexec_span assignments);
 
 int exec_update(sqlexec_env *env, const char *table_name,
-    sqlexec_ref count_ref);
+    sqlexec_ref action_ref);
 
 int exec_delete(sqlexec_env *env, const char *table_name,
-    sqlexec_ref count_ref);
+    sqlexec_ref action_ref);
 
 #endif

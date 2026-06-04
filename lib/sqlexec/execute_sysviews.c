@@ -9,7 +9,7 @@
  */
 
 #include "exec_impl.h"
-#include "../shared/metacache.h"
+#include "metacache.h"
 
 #include <string.h>
 

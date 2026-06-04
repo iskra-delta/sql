@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <string.h>
 #include "sql.h"
+#include "../common/common.h"
 
 /*
  * Clears the output statement before parsing begins.
@@ -20,19 +21,7 @@ static void sql_reset(sql_statement *s)
 {
     memset(s, 0, sizeof(*s));
     s->where.root = (unsigned char)sql_where_nil;
-}
-
-static void copy_name(char *target, const char *source)
-{
-    unsigned short index;
-
-    for (index = 0; index + 1 < sql_name_size; index++) {
-        target[index] = source[index];
-        if (source[index] == '\0') {
-            return;
-        }
-    }
-    target[sql_name_size - 1] = '\0';
+    s->having.root = (unsigned char)sql_where_nil;
 }
 
 static void copy_column_ref_name(sql_column_ref *target, const char *qualifier,
@@ -40,6 +29,276 @@ static void copy_column_ref_name(sql_column_ref *target, const char *qualifier,
 {
     copy_name(target->qualifier, qualifier);
     copy_name(target->name, name);
+}
+
+#define stmt_column_count(stmt) ((stmt)->detail.variant.create_table.column_count)
+#define stmt_columns(stmt) ((stmt)->detail.variant.create_table.columns)
+#define stmt_index_unique(stmt) ((stmt)->detail.variant.create_index.unique)
+#define stmt_key_count(stmt) ((stmt)->detail.variant.create_index.key_count)
+#define stmt_key_names(stmt) ((stmt)->detail.variant.create_index.key_names)
+#define stmt_assignment_count(stmt) ((stmt)->detail.variant.mutate.assignment_count)
+#define stmt_assignments(stmt) ((stmt)->detail.variant.mutate.assignments)
+#define stmt_from_is_subquery(stmt) ((stmt)->detail.select.from_is_subquery)
+#define stmt_from_alias(stmt) ((stmt)->detail.select.from_alias)
+#define stmt_join_count(stmt) ((stmt)->detail.select.join_count)
+#define stmt_join_table_names(stmt) ((stmt)->detail.select.join_table_names)
+#define stmt_join_aliases(stmt) ((stmt)->detail.select.join_aliases)
+#define stmt_select_all(stmt) ((stmt)->detail.select.select_all)
+#define stmt_select_distinct(stmt) ((stmt)->detail.select.select_distinct)
+#define stmt_select_count_star(stmt) ((stmt)->detail.select.select_count_star)
+#define stmt_select_has_aggregate(stmt) ((stmt)->detail.select.select_has_aggregate)
+#define stmt_select_count(stmt) ((stmt)->detail.select.select_count)
+#define stmt_select_items(stmt) ((stmt)->detail.select.select_items)
+#define stmt_group_count(stmt) ((stmt)->detail.select.group_count)
+#define stmt_group_items(stmt) ((stmt)->detail.select.group_items)
+
+static int column_ref_matches(const sql_column_ref *left,
+    const sql_column_ref *right)
+{
+    if (strcmp(left->name, right->name) != 0) {
+        return 0;
+    }
+    return left->qualifier[0] == '\0' || right->qualifier[0] == '\0'
+        || strcmp(left->qualifier, right->qualifier) == 0;
+}
+
+static int select_item_is_aggregate(const sql_select_item *item)
+{
+    if (item->function == sql_function_count) {
+        return 1;
+    }
+    if (item->function == sql_function_min) {
+        return 1;
+    }
+    return item->function == sql_function_max
+        || item->function == sql_function_sum
+        || item->function == sql_function_avg;
+}
+
+static const char *select_item_output_name(const sql_select_item *item)
+{
+    if (item->alias[0] != '\0') {
+        return item->alias;
+    }
+    if (item->function == sql_function_count && item->argument_is_star) {
+        return "count";
+    }
+    return item->alias[0] != '\0' ? item->alias : item->column.name;
+}
+
+static unsigned char statement_source_count(const sql_statement *stmt)
+{
+    return (unsigned char)(1u + stmt_join_count(stmt));
+}
+
+static const char *statement_source_name(const sql_statement *stmt,
+    unsigned char index)
+{
+    if (index == 0) {
+        return stmt->name;
+    }
+    return stmt_join_table_names(stmt)[index - 1u];
+}
+
+static const char *statement_source_alias(const sql_statement *stmt,
+    unsigned char index)
+{
+    if (index == 0) {
+        return stmt_from_alias(stmt);
+    }
+    return stmt_join_aliases(stmt)[index - 1u];
+}
+
+typedef unsigned char sql_token_kind;
+enum {
+    sql_token_invalid = 0,
+    sql_token_eof,
+    sql_token_identifier,
+    sql_token_number,
+    sql_token_string,
+    sql_token_lparen,
+    sql_token_rparen,
+    sql_token_comma,
+    sql_token_dot,
+    sql_token_star,
+    sql_token_semicolon,
+    sql_token_equal,
+    sql_token_not_equal,
+    sql_token_less,
+    sql_token_less_equal,
+    sql_token_greater,
+    sql_token_greater_equal
+};
+
+typedef unsigned char sql_keyword;
+enum {
+    sql_keyword_none = 0,
+    sql_keyword_all,
+    sql_keyword_and,
+    sql_keyword_any,
+    sql_keyword_avg,
+    sql_keyword_as,
+    sql_keyword_between,
+    sql_keyword_by,
+    sql_keyword_char,
+    sql_keyword_character,
+    sql_keyword_count,
+    sql_keyword_create,
+    sql_keyword_database,
+    sql_keyword_databases,
+    sql_keyword_date,
+    sql_keyword_delete,
+    sql_keyword_distinct,
+    sql_keyword_drop,
+    sql_keyword_exists,
+    sql_keyword_from,
+    sql_keyword_group,
+    sql_keyword_having,
+    sql_keyword_in,
+    sql_keyword_index,
+    sql_keyword_insert,
+    sql_keyword_into,
+    sql_keyword_is,
+    sql_keyword_join,
+    sql_keyword_like,
+    sql_keyword_logical,
+    sql_keyword_max,
+    sql_keyword_min,
+    sql_keyword_not,
+    sql_keyword_null,
+    sql_keyword_numeric,
+    sql_keyword_on,
+    sql_keyword_or,
+    sql_keyword_select,
+    sql_keyword_set,
+    sql_keyword_show,
+    sql_keyword_sum,
+    sql_keyword_table,
+    sql_keyword_trim,
+    sql_keyword_unique,
+    sql_keyword_update,
+    sql_keyword_use,
+    sql_keyword_values,
+    sql_keyword_view,
+    sql_keyword_views,
+    sql_keyword_where
+};
+
+typedef struct sql_keyword_entry {
+    const char *name;
+    sql_keyword keyword;
+} sql_keyword_entry;
+
+static const sql_keyword_entry sql_keywords[] = {
+    { "ALL", sql_keyword_all },
+    { "AND", sql_keyword_and },
+    { "ANY", sql_keyword_any },
+    { "AVG", sql_keyword_avg },
+    { "AS", sql_keyword_as },
+    { "BETWEEN", sql_keyword_between },
+    { "BY", sql_keyword_by },
+    { "CHAR", sql_keyword_char },
+    { "CHARACTER", sql_keyword_character },
+    { "COUNT", sql_keyword_count },
+    { "CREATE", sql_keyword_create },
+    { "DATABASE", sql_keyword_database },
+    { "DATABASES", sql_keyword_databases },
+    { "DATE", sql_keyword_date },
+    { "DELETE", sql_keyword_delete },
+    { "DISTINCT", sql_keyword_distinct },
+    { "DROP", sql_keyword_drop },
+    { "EXISTS", sql_keyword_exists },
+    { "FROM", sql_keyword_from },
+    { "GROUP", sql_keyword_group },
+    { "HAVING", sql_keyword_having },
+    { "IN", sql_keyword_in },
+    { "INDEX", sql_keyword_index },
+    { "INSERT", sql_keyword_insert },
+    { "INTO", sql_keyword_into },
+    { "IS", sql_keyword_is },
+    { "JOIN", sql_keyword_join },
+    { "LIKE", sql_keyword_like },
+    { "LOGICAL", sql_keyword_logical },
+    { "MAX", sql_keyword_max },
+    { "MIN", sql_keyword_min },
+    { "NOT", sql_keyword_not },
+    { "NULL", sql_keyword_null },
+    { "NUMERIC", sql_keyword_numeric },
+    { "ON", sql_keyword_on },
+    { "OR", sql_keyword_or },
+    { "SELECT", sql_keyword_select },
+    { "SET", sql_keyword_set },
+    { "SHOW", sql_keyword_show },
+    { "SUM", sql_keyword_sum },
+    { "TABLE", sql_keyword_table },
+    { "TRIM", sql_keyword_trim },
+    { "UNIQUE", sql_keyword_unique },
+    { "UPDATE", sql_keyword_update },
+    { "USE", sql_keyword_use },
+    { "VALUES", sql_keyword_values },
+    { "VIEW", sql_keyword_view },
+    { "VIEWS", sql_keyword_views },
+    { "WHERE", sql_keyword_where }
+};
+
+typedef struct sql_token {
+    sql_token_kind kind;
+    sql_keyword keyword;
+    const char *text;
+    const char *next;
+    unsigned short length;
+} sql_token;
+
+typedef struct sql_lexer {
+    sql_token token;
+} sql_lexer;
+
+typedef unsigned char sql_scalar_expr_kind;
+enum {
+    sql_scalar_expr_invalid = 0,
+    sql_scalar_expr_value,
+    sql_scalar_expr_column,
+    sql_scalar_expr_function
+};
+
+typedef struct sql_scalar_expr {
+    sql_scalar_expr_kind kind;
+    sql_value value;
+    sql_column_ref column;
+    sql_select_function function;
+    unsigned char argument_is_star;
+} sql_scalar_expr;
+
+static int keyword_text_matches(const char *text, unsigned short length,
+    const char *keyword)
+{
+    unsigned short index;
+
+    index = 0;
+    while (keyword[index] != '\0') {
+        if (index >= length
+            || toupper((unsigned char)text[index])
+                != toupper((unsigned char)keyword[index])) {
+            return 0;
+        }
+        index++;
+    }
+    return index == length;
+}
+
+static sql_keyword keyword_from_identifier(const char *text,
+    unsigned short length)
+{
+    unsigned short index;
+
+    for (index = 0;
+        index < sizeof(sql_keywords) / sizeof(sql_keywords[0]);
+        index++) {
+        if (keyword_text_matches(text, length, sql_keywords[index].name)) {
+            return sql_keywords[index].keyword;
+        }
+    }
+    return sql_keyword_none;
 }
 
 /*
@@ -53,196 +312,436 @@ static const char *skip_space(const char *text)
 }
 
 /*
- * Compares one keyword without caring about ASCII letter case.
- * Returns zero when the match fails or is not on a word boundary.
+ * Reads one token from the SQL text with one-token lookahead.
+ * The token skips leading whitespace and reports its source span.
+ * Returns the next input position or NULL for malformed string tokens.
  */
-static int keyword_matches(const char *text, const char *keyword)
+static const char *read_token(const char *text, sql_token *token)
 {
-    while (*keyword) {
-        if (toupper((unsigned char)*text) != toupper((unsigned char)*keyword))
-            return 0;
-        text++;
-        keyword++;
-    }
-    return !(isalnum((unsigned char)*text) || *text == '_');
-}
+    const char *start;
+    const char *p;
 
-/*
- * Reads one SQL identifier into a fixed output buffer.
- */
-static const char *read_identifier(const char *text, char *name)
-{
-    unsigned short i;
-    if (!isalpha((unsigned char)*text) && *text != '_')
-        return NULL;
-    i = 0;
-    while (isalnum((unsigned char)*text) || *text == '_') {
-        if (i + 1 >= sql_name_size)
+    start = skip_space(text);
+    token->text = start;
+    token->next = start;
+    token->length = 0;
+    token->keyword = sql_keyword_none;
+    if (*start == '\0') {
+        token->kind = sql_token_eof;
+        return start;
+    }
+
+    if (isalpha((unsigned char)*start) || *start == '_') {
+        p = start + 1;
+        while (isalnum((unsigned char)*p) || *p == '_') {
+            p++;
+        }
+        token->kind = sql_token_identifier;
+        token->next = p;
+        token->length = (unsigned short)(p - start);
+        token->keyword = keyword_from_identifier(start, token->length);
+        return p;
+    }
+
+    if (isdigit((unsigned char)*start)) {
+        p = start + 1;
+        while (isdigit((unsigned char)*p)) {
+            p++;
+        }
+        token->kind = sql_token_number;
+        token->next = p;
+        token->length = (unsigned short)(p - start);
+        return p;
+    }
+
+    if (*start == '\'') {
+        p = start + 1;
+        while (*p && *p != '\'') {
+            p++;
+        }
+        if (*p != '\'') {
             return NULL;
-        name[i++] = *text++;
+        }
+        token->kind = sql_token_string;
+        token->next = p + 1;
+        token->length = (unsigned short)((p + 1) - start);
+        return p + 1;
     }
-    name[i] = '\0';
-    return text;
+
+    token->length = 1;
+    token->next = start + 1;
+    if (*start == '(') {
+        token->kind = sql_token_lparen;
+        return token->next;
+    }
+    if (*start == ')') {
+        token->kind = sql_token_rparen;
+        return token->next;
+    }
+    if (*start == ',') {
+        token->kind = sql_token_comma;
+        return token->next;
+    }
+    if (*start == '.') {
+        token->kind = sql_token_dot;
+        return token->next;
+    }
+    if (*start == '*') {
+        token->kind = sql_token_star;
+        return token->next;
+    }
+    if (*start == ';') {
+        token->kind = sql_token_semicolon;
+        return token->next;
+    }
+    if (*start == '=' && start[1] == '\0') {
+        token->kind = sql_token_equal;
+        return token->next;
+    }
+    if (*start == '<' && start[1] == '>') {
+        token->kind = sql_token_not_equal;
+        token->next = start + 2;
+        token->length = 2;
+        return token->next;
+    }
+    if (*start == '!' && start[1] == '=') {
+        token->kind = sql_token_not_equal;
+        token->next = start + 2;
+        token->length = 2;
+        return token->next;
+    }
+    if (*start == '<' && start[1] == '=') {
+        token->kind = sql_token_less_equal;
+        token->next = start + 2;
+        token->length = 2;
+        return token->next;
+    }
+    if (*start == '>' && start[1] == '=') {
+        token->kind = sql_token_greater_equal;
+        token->next = start + 2;
+        token->length = 2;
+        return token->next;
+    }
+    if (*start == '=') {
+        token->kind = sql_token_equal;
+        return token->next;
+    }
+    if (*start == '<') {
+        token->kind = sql_token_less;
+        return token->next;
+    }
+    if (*start == '>') {
+        token->kind = sql_token_greater;
+        return token->next;
+    }
+
+    token->kind = sql_token_invalid;
+    return token->next;
 }
 
-/*
- * Reads one column reference with an optional qualifier.
- * Accepts either name or qualifier.name and stores the field part in
- * name while storing any qualifier separately.
- */
-static const char *read_field_reference(const char *text, char *qualifier,
+static int lexer_reposition(sql_lexer *lexer, const char *text)
+{
+    return read_token(text, &lexer->token) ? 0 : -1;
+}
+
+static int lexer_init(sql_lexer *lexer, const char *text)
+{
+    return lexer_reposition(lexer, text);
+}
+
+static int lexer_advance(sql_lexer *lexer)
+{
+    return lexer_reposition(lexer, lexer->token.next);
+}
+
+static const char *lexer_position(const sql_lexer *lexer)
+{
+    return lexer->token.text;
+}
+
+static int lexer_peek_kind(const sql_lexer *lexer, sql_token_kind kind)
+{
+    return lexer->token.kind == kind;
+}
+
+static int lexer_peek_keyword(const sql_lexer *lexer, sql_keyword keyword)
+{
+    return lexer->token.kind == sql_token_identifier
+        && lexer->token.keyword == keyword;
+}
+
+static int lexer_accept_kind(sql_lexer *lexer, sql_token_kind kind)
+{
+    if (!lexer_peek_kind(lexer, kind)) {
+        return 0;
+    }
+    return lexer_advance(lexer) == 0;
+}
+
+static int lexer_accept_keyword(sql_lexer *lexer, sql_keyword keyword)
+{
+    if (!lexer_peek_keyword(lexer, keyword)) {
+        return 0;
+    }
+    return lexer_advance(lexer) == 0;
+}
+
+static int lexer_accept_identifier(sql_lexer *lexer, char *name)
+{
+    if (lexer->token.kind != sql_token_identifier
+        || lexer->token.length + 1 > sql_name_size) {
+        return 0;
+    }
+    memcpy(name, lexer->token.text, lexer->token.length);
+    name[lexer->token.length] = '\0';
+    return lexer_advance(lexer) == 0;
+}
+
+static int lexer_accept_number(sql_lexer *lexer, unsigned short *value)
+{
+    unsigned short index;
+    unsigned short number;
+
+    if (lexer->token.kind != sql_token_number) {
+        return 0;
+    }
+    number = 0;
+    for (index = 0; index < lexer->token.length; index++) {
+        number = (unsigned short)(number * 10
+            + (unsigned short)(lexer->token.text[index] - '0'));
+    }
+    *value = number;
+    return lexer_advance(lexer) == 0;
+}
+
+static int lexer_accept_field_reference(sql_lexer *lexer, char *qualifier,
     char *name)
 {
     char first[sql_name_size];
-    const char *next;
 
     qualifier[0] = '\0';
-    next = read_identifier(text, first);
-    if (!next) {
-        return NULL;
+    if (!lexer_accept_identifier(lexer, first)) {
+        return 0;
     }
-
-    next = skip_space(next);
-    if (*next != '.') {
+    if (!lexer_accept_kind(lexer, sql_token_dot)) {
         copy_name(name, first);
-        return next;
+        return 1;
     }
-
     copy_name(qualifier, first);
-    next = skip_space(next + 1);
-    next = read_identifier(next, name);
-    return next;
+    return lexer_accept_identifier(lexer, name);
+}
+
+static int lexer_peek_parenthesized_select(const sql_lexer *lexer)
+{
+    sql_token token;
+
+    if (!lexer_peek_kind(lexer, sql_token_lparen)) {
+        return 0;
+    }
+    if (!read_token(lexer->token.next, &token)) {
+        return 0;
+    }
+    return token.kind == sql_token_identifier
+        && token.keyword == sql_keyword_select;
+}
+
+static int scalar_expr_to_value(const sql_scalar_expr *expr,
+    sql_value *value);
+
+static int encode_column_ref_value(const sql_column_ref *column,
+    sql_value *value)
+{
+    unsigned short qlen;
+    unsigned short nlen;
+
+    value->type = sql_value_identifier;
+    if (column->qualifier[0] == '\0') {
+        if ((unsigned short)(strlen(column->name) + 1) > sql_value_size) {
+            return -1;
+        }
+        copy_name(value->text, column->name);
+        return 0;
+    }
+
+    qlen = (unsigned short)strlen(column->qualifier);
+    nlen = (unsigned short)strlen(column->name);
+    if ((unsigned short)(qlen + 1 + nlen + 1) > sql_value_size) {
+        return -1;
+    }
+    memcpy(value->text, column->qualifier, qlen);
+    value->text[qlen] = '.';
+    memcpy(value->text + qlen + 1, column->name, nlen);
+    value->text[qlen + 1 + nlen] = '\0';
+    return 0;
+}
+
+static int keyword_to_select_function(sql_keyword keyword,
+    sql_select_function *function)
+{
+    switch (keyword) {
+    case sql_keyword_trim:
+        *function = sql_function_trim;
+        return 1;
+    case sql_keyword_count:
+        *function = sql_function_count;
+        return 1;
+    case sql_keyword_min:
+        *function = sql_function_min;
+        return 1;
+    case sql_keyword_max:
+        *function = sql_function_max;
+        return 1;
+    case sql_keyword_sum:
+        *function = sql_function_sum;
+        return 1;
+    case sql_keyword_avg:
+        *function = sql_function_avg;
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 /*
- * Reads one unsigned number from the SQL text.
+ * Extracts one parenthesized SELECT body without the outer parens.
+ * Returns the text position just after the closing ')'.
  */
-static const char *read_number(const char *text, unsigned short *value)
+static const char *parse_parenthesized_select_body(sql_lexer *lexer,
+    char *subquery_out)
 {
-    unsigned short n;
-    if (!isdigit((unsigned char)*text))
+    const char *inner_start;
+    const char *p;
+    unsigned short inner_len;
+    int depth;
+
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
         return NULL;
-    n = 0;
-    while (isdigit((unsigned char)*text))
-        n = (unsigned short)(n * 10 + (*text++ - '0'));
-    *value = n;
-    return text;
+    }
+    if (!lexer_peek_keyword(lexer, sql_keyword_select)) {
+        return NULL;
+    }
+    inner_start = lexer_position(lexer);
+
+    depth = 1;
+    p = inner_start;
+    while (*p && depth > 0) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                break;
+            }
+        }
+        p++;
+    }
+    if (depth != 0) {
+        return NULL;
+    }
+
+    inner_len = (unsigned short)(p - inner_start);
+    if (inner_len == 0 || inner_len >= sql_subquery_size) {
+        return NULL;
+    }
+    memcpy(subquery_out, inner_start, inner_len);
+    subquery_out[inner_len] = '\0';
+    return lexer_reposition(lexer, p + 1) == 0
+        ? lexer_position(lexer) : NULL;
 }
 
-/*
- * Parses one SQL value and records its inferred type.
- * Handles single-quoted strings, digit sequences, and bare identifiers.
- */
-static const char *parse_value(const char *text, sql_value *val)
+static int find_predicate_subquery(const sql_statement *stmt,
+    const char *sql_text)
 {
-    unsigned short i;
-    text = skip_space(text);
-    if (*text == '\'') {
-        val->type = sql_value_string;
-        text++;
-        i = 0;
-        while (*text && *text != '\'') {
-            if (i + 1 >= sql_value_size)
-                return NULL;
-            val->text[i++] = *text++;
+    unsigned char index;
+
+    for (index = 0; index < stmt->predicate_subquery_count; index++) {
+        if (strcmp(stmt->predicate_subqueries[index], sql_text) == 0) {
+            return (int)index;
         }
-        if (*text != '\'')
+    }
+    return -1;
+}
+
+static int add_predicate_subquery(sql_statement *stmt, const char *sql_text,
+    unsigned char *index_out)
+{
+    int existing;
+
+    existing = find_predicate_subquery(stmt, sql_text);
+    if (existing >= 0) {
+        *index_out = (unsigned char)existing;
+        return 0;
+    }
+    if (stmt->predicate_subquery_count >= sql_max_predicate_subqueries) {
+        return -1;
+    }
+    *index_out = stmt->predicate_subquery_count++;
+    copy_subquery(stmt->predicate_subqueries[*index_out], sql_text);
+    return 0;
+}
+
+static const char *skip_constraints_lexer(sql_lexer *lexer)
+{
+    while (lexer->token.kind != sql_token_eof
+        && lexer->token.kind != sql_token_comma
+        && lexer->token.kind != sql_token_rparen) {
+        if (lexer_advance(lexer) != 0) {
             return NULL;
-        val->text[i] = '\0';
-        return text + 1;
-    }
-    if (isdigit((unsigned char)*text)) {
-        val->type = sql_value_number;
-        i = 0;
-        while (isdigit((unsigned char)*text)) {
-            if (i + 1 >= sql_value_size)
-                return NULL;
-            val->text[i++] = *text++;
         }
-        val->text[i] = '\0';
-        return text;
     }
-    val->type = sql_value_identifier;
-    return read_identifier(text, val->text);
-}
-
-/*
- * Skips unsupported column constraints until comma or right paren.
- */
-static const char *skip_constraints(const char *text)
-{
-    while (*text && *text != ',' && *text != ')')
-        text++;
-    return text;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses CHAR(n), CHARACTER(n), NUMERIC(n[,d]), DATE, or LOGICAL.
- * CHAR and CHARACTER share the same body; klen selects the keyword length.
  */
-static const char *parse_column_type(const char *text, sql_column *col)
+static const char *parse_column_type_lexer(sql_lexer *lexer, sql_column *col)
 {
     unsigned short len;
     unsigned short dec;
-    unsigned short klen;
 
-    text = skip_space(text);
-    klen = 0;
-    if (keyword_matches(text, "CHARACTER"))
-        klen = 9;
-    else if (keyword_matches(text, "CHAR"))
-        klen = 4;
-    if (klen) {
-        text += klen;
-        text = skip_space(text);
-        if (*text++ != '(')
+    if (lexer_accept_keyword(lexer, sql_keyword_character)
+        || lexer_accept_keyword(lexer, sql_keyword_char)) {
+        if (!lexer_accept_kind(lexer, sql_token_lparen)
+            || !lexer_accept_number(lexer, &len) || !len || len > 255
+            || !lexer_accept_kind(lexer, sql_token_rparen)) {
             return NULL;
-        text = skip_space(text);
-        if (!(text = read_number(text, &len)) || !len || len > 255)
-            return NULL;
-        text = skip_space(text);
-        if (*text++ != ')')
-            return NULL;
+        }
         col->dbf_type = 'C';
         col->length = (unsigned char)len;
         col->decimals = 0;
-        return text;
+        return lexer_position(lexer);
     }
-    if (keyword_matches(text, "NUMERIC")) {
-        text += 7;
-        text = skip_space(text);
-        if (*text++ != '(')
+    if (lexer_accept_keyword(lexer, sql_keyword_numeric)) {
+        if (!lexer_accept_kind(lexer, sql_token_lparen)
+            || !lexer_accept_number(lexer, &len) || !len || len > 255) {
             return NULL;
-        text = skip_space(text);
-        if (!(text = read_number(text, &len)) || !len || len > 255)
-            return NULL;
-        dec = 0;
-        text = skip_space(text);
-        if (*text == ',') {
-            text++;
-            text = skip_space(text);
-            if (!(text = read_number(text, &dec)) || dec > len)
-                return NULL;
         }
-        text = skip_space(text);
-        if (*text++ != ')')
+        dec = 0;
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
+            if (!lexer_accept_number(lexer, &dec) || dec > len) {
+                return NULL;
+            }
+        }
+        if (!lexer_accept_kind(lexer, sql_token_rparen)) {
             return NULL;
+        }
         col->dbf_type = 'N';
         col->length = (unsigned char)len;
         col->decimals = (unsigned char)dec;
-        return text;
+        return lexer_position(lexer);
     }
-    if (keyword_matches(text, "DATE")) {
+    if (lexer_accept_keyword(lexer, sql_keyword_date)) {
         col->dbf_type = 'D';
         col->length = 8;
         col->decimals = 0;
-        return text + 4;
+        return lexer_position(lexer);
     }
-    if (keyword_matches(text, "LOGICAL")) {
+    if (lexer_accept_keyword(lexer, sql_keyword_logical)) {
         col->dbf_type = 'L';
         col->length = 1;
         col->decimals = 0;
-        return text + 7;
+        return lexer_position(lexer);
     }
     return NULL;
 }
@@ -250,49 +749,58 @@ static const char *parse_column_type(const char *text, sql_column *col)
 /*
  * Parses one CREATE TABLE column definition.
  */
-static const char *parse_column(const char *text, sql_column *col)
+static const char *parse_column_lexer(sql_lexer *lexer, sql_column *col)
 {
-    text = skip_space(text);
-    text = read_identifier(text, col->name);
-    if (!text)
+    if (!lexer_accept_identifier(lexer, col->name)
+        || !parse_column_type_lexer(lexer, col)) {
         return NULL;
-    text = parse_column_type(text, col);
-    if (!text)
-        return NULL;
-    text = skip_space(text);
-    return skip_constraints(text);
+    }
+    return skip_constraints_lexer(lexer);
 }
 
-/*
- * Parses one SQL comparison operator used by WHERE.
- */
-static const char *parse_compare_operator(const char *text,
-    sql_compare_operator *op)
+static const char *parse_column_list_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
 {
-    if (text[0] == '<' && text[1] == '>') { *op = sql_compare_not_equal;     return text + 2; }
-    if (text[0] == '!' && text[1] == '=') { *op = sql_compare_not_equal;     return text + 2; }
-    if (text[0] == '<' && text[1] == '=') { *op = sql_compare_less_equal;    return text + 2; }
-    if (text[0] == '>' && text[1] == '=') { *op = sql_compare_greater_equal; return text + 2; }
-    if (text[0] == '=') { *op = sql_compare_equal;   return text + 1; }
-    if (text[0] == '<') { *op = sql_compare_less;    return text + 1; }
-    if (text[0] == '>') { *op = sql_compare_greater; return text + 1; }
-    return NULL;
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
+        return NULL;
+    }
+    while (1) {
+        if (stmt_column_count(stmt) >= sql_max_columns) {
+            return NULL;
+        }
+        if (!parse_column_lexer(lexer,
+            &stmt_columns(stmt)[stmt_column_count(stmt)])) {
+            return NULL;
+        }
+        stmt_column_count(stmt)++;
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
+            continue;
+        }
+        return lexer_accept_kind(lexer, sql_token_rparen)
+            ? lexer_position(lexer) : NULL;
+    }
 }
 
 /*
  * Allocates one predicate node inside the statement-local WHERE pool.
  */
-static int where_add_node(sql_statement *stmt, sql_where_node_type type,
-    unsigned char *ref_out)
+typedef struct sql_where_target {
+    sql_where *where;
+    sql_where_node *nodes;
+    sql_predicate_operand *values;
+} sql_where_target;
+
+static int where_add_node(sql_where_target *target,
+    sql_where_node_type type, unsigned char *ref_out)
 {
     sql_where_node *node;
 
-    if (stmt->where.node_count >= sql_where_max_nodes) {
+    if (target->where->node_count >= sql_where_max_nodes) {
         return -1;
     }
 
-    *ref_out = stmt->where.node_count++;
-    node = &stmt->where_nodes[*ref_out];
+    *ref_out = target->where->node_count++;
+    node = &target->nodes[*ref_out];
     memset(node, 0, sizeof(*node));
     node->type = type;
     node->left = (unsigned char)sql_where_nil;
@@ -303,15 +811,15 @@ static int where_add_node(sql_statement *stmt, sql_where_node_type type,
 /*
  * Appends one SQL value to the statement-local WHERE value pool.
  */
-static int where_add_value(sql_statement *stmt, const sql_value *value,
-    unsigned char *index_out)
+static int where_add_operand(sql_where_target *target,
+    const sql_predicate_operand *operand, unsigned char *index_out)
 {
-    if (stmt->where.value_count >= sql_where_max_values) {
+    if (target->where->value_count >= sql_where_max_values) {
         return -1;
     }
 
-    *index_out = stmt->where.value_count;
-    stmt->where_values[stmt->where.value_count++] = *value;
+    *index_out = target->where->value_count;
+    target->values[target->where->value_count++] = *operand;
     return 0;
 }
 
@@ -319,7 +827,7 @@ static int where_add_value(sql_statement *stmt, const sql_value *value,
  * Resolves one parsed qualifier against the current FROM table.
  * Empty qualifiers are always accepted.
  */
-static int qualifier_matches_source(const char *qualifier,
+static int qualifier_matches_pair(const char *qualifier,
     const char *table_name, const char *table_alias)
 {
     if (qualifier[0] == '\0') {
@@ -331,195 +839,387 @@ static int qualifier_matches_source(const char *qualifier,
     return table_alias[0] != '\0' && strcmp(qualifier, table_alias) == 0;
 }
 
-static int qualifier_matches_tables(const char *qualifier,
-    const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias)
+static int qualifier_matches_sources(const char *qualifier,
+    const sql_statement *stmt, unsigned char source_count)
 {
-    if (qualifier_matches_source(qualifier, table_name, table_alias)) {
+    unsigned char index;
+
+    if (qualifier[0] == '\0') {
         return 1;
     }
-    return join_table_name[0] != '\0'
-        && qualifier_matches_source(qualifier, join_table_name, join_alias);
+    for (index = 0; index < source_count; index++) {
+        if (qualifier_matches_pair(qualifier,
+            statement_source_name(stmt, index),
+            statement_source_alias(stmt, index))) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
-/*
- * Reads one WHERE column reference, optionally allowing qualification.
- */
-static const char *read_where_column(const char *text, char *qualifier_out,
-    char *column_name,
-    const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
+static int scalar_expr_column_matches_sources(const sql_scalar_expr *expr,
+    const sql_statement *stmt, unsigned char source_count,
     unsigned char allow_qualifier)
 {
-    char qualifier[sql_name_size];
-    char field_name[sql_name_size];
-
-    text = skip_space(text);
-    if (allow_qualifier) {
-        text = read_field_reference(text, qualifier, field_name);
-        if (!text || !qualifier_matches_tables(qualifier, table_name,
-            table_alias, join_table_name, join_alias)) {
-            return NULL;
-        }
-    } else {
-        text = read_identifier(text, field_name);
-        if (!text) {
-            return NULL;
-        }
-        qualifier[0] = '\0';
+    if (expr->kind != sql_scalar_expr_column) {
+        return 0;
     }
-
-    copy_name(qualifier_out, qualifier);
-    copy_name(column_name, field_name);
-    return text;
+    if (!allow_qualifier) {
+        return expr->column.qualifier[0] == '\0';
+    }
+    return qualifier_matches_sources(expr->column.qualifier, stmt,
+        source_count);
 }
+
+static const char *parse_predicate_operand_lexer(sql_lexer *lexer,
+    sql_predicate_operand *operand);
 
 /*
  * Parses one IN (...) value list into the statement-local WHERE pool.
  */
-static const char *parse_in_value_list(const char *text, sql_statement *stmt,
-    unsigned char *first_out, unsigned char *count_out)
+static const char *parse_in_value_list_lexer(sql_lexer *lexer,
+    sql_where_target *target, unsigned char *first_out,
+    unsigned char *count_out)
 {
-    sql_value value;
-    unsigned char first;
-    unsigned char count;
+    sql_predicate_operand operand;
     unsigned char index;
 
-    text = skip_space(text);
-    if (*text++ != '(') {
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
         return NULL;
     }
 
-    count = 0;
-    first = stmt->where.value_count;
+    *first_out = target->where->value_count;
+    *count_out = 0;
     while (1) {
-        text = parse_value(text, &value);
-        if (!text || where_add_value(stmt, &value, &index) != 0) {
+        if (!parse_predicate_operand_lexer(lexer, &operand)
+            || where_add_operand(target, &operand, &index) != 0) {
             return NULL;
         }
-        count++;
-
-        text = skip_space(text);
-        if (*text == ',') {
-            text++;
+        (*count_out)++;
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
             continue;
         }
-        if (*text == ')') {
-            *first_out = first;
-            *count_out = count;
-            return text + 1;
-        }
-        return NULL;
+        return lexer_accept_kind(lexer, sql_token_rparen)
+            ? lexer_position(lexer) : NULL;
     }
 }
 
 /*
  * Parses one atomic predicate: comparison, IN, or parenthesised group.
  */
-static const char *parse_where_or_expression(const char *text,
-    sql_statement *stmt, const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
-    unsigned char allow_qualifier, unsigned char *ref_out);
+static const char *parse_scalar_expr_lexer(sql_lexer *lexer,
+    unsigned char allow_functions, sql_scalar_expr *expr);
+static const char *parse_scalar_column_expr_lexer(sql_lexer *lexer,
+    const sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_scalar_expr *expr);
+static const char *parse_where_or_expression_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target,
+    unsigned char *ref_out);
 
-static const char *parse_where_primary(const char *text, sql_statement *stmt,
-    const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
-    unsigned char allow_qualifier, unsigned char *ref_out)
+static int make_compare_node(sql_where_target *target, const char *qualifier,
+    const char *column_name, sql_compare_operator operator,
+    const sql_predicate_operand *operand, unsigned char *ref_out)
 {
-    sql_value value;
-    sql_compare_operator operator;
     sql_where_node *node;
     unsigned char value_first;
-    unsigned char value_count;
-    unsigned char node_ref;
 
-    text = skip_space(text);
-    if (*text == '(') {
-        text = parse_where_or_expression(text + 1, stmt, table_name,
-            table_alias, join_table_name, join_alias, allow_qualifier,
-            ref_out);
-        if (!text) {
-            return NULL;
-        }
-        text = skip_space(text);
-        return *text == ')' ? text + 1 : NULL;
+    if (where_add_node(target, sql_where_compare, ref_out) != 0
+        || where_add_operand(target, operand, &value_first) != 0) {
+        return -1;
     }
-
-    if (where_add_node(stmt, sql_where_compare, &node_ref) != 0) {
-        return NULL;
-    }
-    node = &stmt->where_nodes[node_ref];
-    text = read_where_column(text, node->qualifier, node->column_name,
-        table_name, table_alias, join_table_name, join_alias,
-        allow_qualifier);
-    if (!text) {
-        return NULL;
-    }
-
-    text = skip_space(text);
-    if (keyword_matches(text, "IN")) {
-        node->type = sql_where_in;
-        text += 2;
-        text = parse_in_value_list(text, stmt, &value_first, &value_count);
-        if (!text || value_count == 0) {
-            return NULL;
-        }
-        node->value_first = value_first;
-        node->value_count = value_count;
-        *ref_out = node_ref;
-        return text;
-    }
-
-    text = parse_compare_operator(text, &operator);
-    if (!text) {
-        return NULL;
-    }
-    text = parse_value(text, &value);
-    if (!text || where_add_value(stmt, &value, &value_first) != 0) {
-        return NULL;
-    }
-
+    node = &target->nodes[*ref_out];
+    copy_name(node->qualifier, qualifier);
+    copy_name(node->column_name, column_name);
     node->operator = operator;
     node->value_first = value_first;
     node->value_count = 1;
-    *ref_out = node_ref;
-    return text;
+    return 0;
+}
+
+static int make_column_node(sql_where_target *target, sql_where_node_type type,
+    const sql_column_ref *column, unsigned char *ref_out)
+{
+    sql_where_node *node;
+
+    if (where_add_node(target, type, ref_out) != 0) {
+        return -1;
+    }
+    node = &target->nodes[*ref_out];
+    copy_name(node->qualifier, column->qualifier);
+    copy_name(node->column_name, column->name);
+    return 0;
+}
+
+static int make_binary_node(sql_where_target *target, sql_where_node_type type,
+    unsigned char left, unsigned char right, unsigned char *ref_out)
+{
+    sql_where_node *node;
+
+    if (where_add_node(target, type, ref_out) != 0) {
+        return -1;
+    }
+    node = &target->nodes[*ref_out];
+    node->left = left;
+    node->right = right;
+    return 0;
+}
+
+static const char *parse_predicate_subquery_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char *index_out)
+{
+    char subquery_text[sql_subquery_size];
+
+    if (!parse_parenthesized_select_body(lexer, subquery_text)
+        || add_predicate_subquery(stmt, subquery_text,
+        index_out) != 0) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static const char *parse_compare_operator_lexer(sql_lexer *lexer,
+    sql_compare_operator *op)
+{
+    switch (lexer->token.kind) {
+    case sql_token_not_equal:
+        *op = sql_compare_not_equal;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    case sql_token_less_equal:
+        *op = sql_compare_less_equal;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    case sql_token_greater_equal:
+        *op = sql_compare_greater_equal;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    case sql_token_equal:
+        *op = sql_compare_equal;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    case sql_token_less:
+        *op = sql_compare_less;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    case sql_token_greater:
+        *op = sql_compare_greater;
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    default:
+        return NULL;
+    }
+}
+
+static const char *parse_where_primary_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target,
+    unsigned char *ref_out)
+{
+    sql_scalar_expr expr;
+    sql_predicate_operand operand;
+    sql_predicate_operand lower_operand;
+    sql_predicate_operand upper_operand;
+    sql_compare_operator operator;
+    unsigned char left_ref;
+    unsigned char right_ref;
+    unsigned char value_count;
+    unsigned char node_ref;
+    unsigned char subquery_index;
+    sql_where_node *node;
+
+    if (lexer_accept_keyword(lexer, sql_keyword_exists)) {
+        if (where_add_node(target, sql_where_exists, &node_ref) != 0) {
+            return NULL;
+        }
+        if (!parse_predicate_subquery_lexer(lexer, stmt, &subquery_index)) {
+            return NULL;
+        }
+        target->nodes[node_ref].subquery_index = subquery_index;
+        *ref_out = node_ref;
+        return lexer_position(lexer);
+    }
+    if (lexer_accept_kind(lexer, sql_token_lparen)) {
+        if (!parse_where_or_expression_lexer(lexer, stmt, source_count,
+            allow_qualifier, target, ref_out)
+            || !lexer_accept_kind(lexer, sql_token_rparen)) {
+            return NULL;
+        }
+        return lexer_position(lexer);
+    }
+
+    if (!parse_scalar_column_expr_lexer(lexer, stmt, source_count,
+        allow_qualifier, &expr)) {
+        return NULL;
+    }
+
+    if (lexer_accept_keyword(lexer, sql_keyword_is)) {
+        if (make_column_node(target, sql_where_is_null, &expr.column,
+            &node_ref) != 0) {
+            return NULL;
+        }
+        node = &target->nodes[node_ref];
+        node->operator = sql_compare_equal;
+        if (lexer_accept_keyword(lexer, sql_keyword_not)) {
+            node->operator = sql_compare_not_equal;
+        }
+        if (!lexer_accept_keyword(lexer, sql_keyword_null)) {
+            return NULL;
+        }
+        *ref_out = node_ref;
+        return lexer_position(lexer);
+    }
+    if (lexer_accept_keyword(lexer, sql_keyword_in)) {
+        if (lexer_peek_parenthesized_select(lexer)) {
+            if (make_column_node(target, sql_where_quantified,
+                &expr.column, &node_ref) != 0) {
+                return NULL;
+            }
+            node = &target->nodes[node_ref];
+            node->operator = sql_compare_equal;
+            node->quantifier = sql_quantifier_any;
+            if (!parse_predicate_subquery_lexer(lexer, stmt,
+                &subquery_index)) {
+                return NULL;
+            }
+            node->subquery_index = subquery_index;
+            *ref_out = node_ref;
+            return lexer_position(lexer);
+        }
+        if (make_column_node(target, sql_where_in, &expr.column,
+            &node_ref) != 0) {
+            return NULL;
+        }
+        node = &target->nodes[node_ref];
+        if (!parse_in_value_list_lexer(lexer, target, &node->value_first,
+            &value_count) || value_count == 0) {
+            return NULL;
+        }
+        node->value_count = value_count;
+        *ref_out = node_ref;
+        return lexer_position(lexer);
+    }
+
+    if (lexer_accept_keyword(lexer, sql_keyword_between)) {
+        if (!parse_predicate_operand_lexer(lexer, &lower_operand)) {
+            return NULL;
+        }
+        if (!lexer_accept_keyword(lexer, sql_keyword_and)) {
+            return NULL;
+        }
+        if (!parse_predicate_operand_lexer(lexer, &upper_operand)) {
+            return NULL;
+        }
+        if (make_compare_node(target, expr.column.qualifier, expr.column.name,
+            sql_compare_greater_equal, &lower_operand, &left_ref) != 0
+            || make_compare_node(target, expr.column.qualifier,
+                expr.column.name,
+                sql_compare_less_equal, &upper_operand, &right_ref) != 0
+            || make_binary_node(target, sql_where_and, left_ref, right_ref,
+                ref_out) != 0) {
+            return NULL;
+        }
+        return lexer_position(lexer);
+    }
+
+    if (lexer_accept_keyword(lexer, sql_keyword_like)) {
+        unsigned char value_first;
+
+        if (!parse_predicate_operand_lexer(lexer, &operand)
+            || make_column_node(target, sql_where_like, &expr.column,
+            &node_ref) != 0
+            || where_add_operand(target, &operand, &value_first) != 0) {
+            return NULL;
+        }
+        node = &target->nodes[node_ref];
+        node->value_first = value_first;
+        node->value_count = 1;
+        *ref_out = node_ref;
+        return lexer_position(lexer);
+    }
+
+    if (!parse_compare_operator_lexer(lexer, &operator)) {
+        return NULL;
+    }
+    if (lexer_peek_keyword(lexer, sql_keyword_any)
+        || lexer_peek_keyword(lexer, sql_keyword_all)) {
+        if (make_column_node(target, sql_where_quantified, &expr.column,
+            &node_ref) != 0) {
+            return NULL;
+        }
+        node = &target->nodes[node_ref];
+        node->operator = operator;
+        if (lexer_accept_keyword(lexer, sql_keyword_any)) {
+            node->quantifier = sql_quantifier_any;
+        } else if (lexer_accept_keyword(lexer, sql_keyword_all)) {
+            node->quantifier = sql_quantifier_all;
+        } else {
+            return NULL;
+        }
+        if (!parse_predicate_subquery_lexer(lexer, stmt, &subquery_index)) {
+            return NULL;
+        }
+        node->subquery_index = subquery_index;
+        *ref_out = node_ref;
+        return lexer_position(lexer);
+    }
+    if (!parse_predicate_operand_lexer(lexer, &operand)) {
+        return NULL;
+    }
+    if (make_compare_node(target, expr.column.qualifier, expr.column.name,
+        operator, &operand, ref_out) != 0) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static const char *parse_where_not_expression_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target,
+    unsigned char *ref_out)
+{
+    unsigned char child_ref;
+    sql_where_node *node;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_not)) {
+        return parse_where_primary_lexer(lexer, stmt, source_count,
+            allow_qualifier, target, ref_out);
+    }
+    if (!parse_where_not_expression_lexer(lexer, stmt, source_count,
+        allow_qualifier, target, &child_ref)
+        || where_add_node(target, sql_where_not, ref_out) != 0) {
+        return NULL;
+    }
+    node = &target->nodes[*ref_out];
+    node->left = child_ref;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses one AND-precedence expression.
  */
-static const char *parse_where_and_expression(const char *text,
-    sql_statement *stmt, const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
-    unsigned char allow_qualifier, unsigned char *ref_out)
+static const char *parse_where_and_expression_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target,
+    unsigned char *ref_out)
 {
     unsigned char left;
     unsigned char right;
     unsigned char node_ref;
     sql_where_node *node;
 
-    text = parse_where_primary(text, stmt, table_name, table_alias,
-        join_table_name, join_alias, allow_qualifier, &left);
-    if (!text) {
+    if (!parse_where_not_expression_lexer(lexer, stmt, source_count,
+        allow_qualifier, target, &left)) {
         return NULL;
     }
 
     while (1) {
-        text = skip_space(text);
-        if (!keyword_matches(text, "AND")) {
+        if (!lexer_accept_keyword(lexer, sql_keyword_and)) {
             *ref_out = left;
-            return text;
+            return lexer_position(lexer);
         }
 
-        text += 3;
-        text = parse_where_primary(text, stmt, table_name, table_alias,
-            join_table_name, join_alias, allow_qualifier, &right);
-        if (!text || where_add_node(stmt, sql_where_and, &node_ref) != 0) {
+        if (!parse_where_not_expression_lexer(lexer, stmt, source_count,
+            allow_qualifier, target, &right)
+            || where_add_node(target, sql_where_and, &node_ref) != 0) {
             return NULL;
         }
 
-        node = &stmt->where_nodes[node_ref];
+        node = &target->nodes[node_ref];
         node->left = left;
         node->right = right;
         left = node_ref;
@@ -529,37 +1229,34 @@ static const char *parse_where_and_expression(const char *text,
 /*
  * Parses one OR-precedence expression.
  */
-static const char *parse_where_or_expression(const char *text,
-    sql_statement *stmt, const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
-    unsigned char allow_qualifier, unsigned char *ref_out)
+static const char *parse_where_or_expression_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target,
+    unsigned char *ref_out)
 {
     unsigned char left;
     unsigned char right;
     unsigned char node_ref;
     sql_where_node *node;
 
-    text = parse_where_and_expression(text, stmt, table_name, table_alias,
-        join_table_name, join_alias, allow_qualifier, &left);
-    if (!text) {
+    if (!parse_where_and_expression_lexer(lexer, stmt, source_count,
+        allow_qualifier, target, &left)) {
         return NULL;
     }
 
     while (1) {
-        text = skip_space(text);
-        if (!keyword_matches(text, "OR")) {
+        if (!lexer_accept_keyword(lexer, sql_keyword_or)) {
             *ref_out = left;
-            return text;
+            return lexer_position(lexer);
         }
 
-        text += 2;
-        text = parse_where_and_expression(text, stmt, table_name, table_alias,
-            join_table_name, join_alias, allow_qualifier, &right);
-        if (!text || where_add_node(stmt, sql_where_or, &node_ref) != 0) {
+        if (!parse_where_and_expression_lexer(lexer, stmt, source_count,
+            allow_qualifier, target, &right)
+            || where_add_node(target, sql_where_or, &node_ref) != 0) {
             return NULL;
         }
 
-        node = &stmt->where_nodes[node_ref];
+        node = &target->nodes[node_ref];
         node->left = left;
         node->right = right;
         left = node_ref;
@@ -570,121 +1267,231 @@ static const char *parse_where_or_expression(const char *text,
  * Parses one optional WHERE expression into the statement-local pool.
  * Returns the input pointer unchanged when WHERE is absent.
  */
-static const char *parse_where_clause(const char *text, sql_statement *stmt,
-    const char *table_name, const char *table_alias,
-    const char *join_table_name, const char *join_alias,
-    unsigned char allow_qualifier)
+static const char *parse_predicate_clause_lexer(sql_lexer *lexer,
+    sql_keyword keyword,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_where_target *target)
 {
+    unsigned char old_active;
+    unsigned char old_root;
     unsigned char root;
 
-    text = skip_space(text);
-    if (!keyword_matches(text, "WHERE")) {
-        return text;
+    if (!lexer_accept_keyword(lexer, keyword)) {
+        return lexer_position(lexer);
     }
 
-    stmt->where.active = 0;
-    stmt->where.root = (unsigned char)sql_where_nil;
-    stmt->where.node_count = 0;
-    stmt->where.value_count = 0;
+    old_active = target->where->active;
+    old_root = target->where->root;
+    if (!old_active) {
+        target->where->root = (unsigned char)sql_where_nil;
+        target->where->node_count = 0;
+        target->where->value_count = 0;
+    }
 
-    text = parse_where_or_expression(text + 5, stmt, table_name, table_alias,
-        join_table_name, join_alias, allow_qualifier, &root);
-    if (!text) {
+    if (!parse_where_or_expression_lexer(lexer, stmt, source_count,
+        allow_qualifier, target, &root)) {
         return NULL;
     }
 
-    stmt->where.active = 1;
-    stmt->where.root = root;
-    return text;
+    if (old_active) {
+        if (make_binary_node(target, sql_where_and, old_root, root,
+            &target->where->root) != 0) {
+            return NULL;
+        }
+    } else {
+        target->where->root = root;
+    }
+    target->where->active = 1;
+    return lexer_position(lexer);
 }
 
-/*
- * Parses one comma-separated list of SQL values inside parentheses.
- */
-static const char *parse_value_list(const char *text, sql_statement *stmt)
+static const char *parse_where_clause_lexer(sql_lexer *lexer,
+    sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier)
 {
+    sql_where_target target;
     const char *next;
-    text = skip_space(text);
-    if (*text++ != '(')
-        return NULL;
-    while (1) {
-        if (stmt->value_count >= sql_max_columns)
-            return NULL;
-        next = parse_value(text, &stmt->values[stmt->value_count]);
-        if (!next)
-            return NULL;
-        stmt->value_count++;
-        text = skip_space(next);
-        if (*text == ',') { text++; continue; }
-        if (*text == ')') return text + 1;
+
+    target.where = &stmt->where;
+    target.nodes = stmt->where_nodes;
+    target.values = stmt->where_values;
+    next = parse_predicate_clause_lexer(lexer, sql_keyword_where, stmt,
+        source_count, allow_qualifier, &target);
+    if (!next) {
         return NULL;
     }
+    if (stmt->where.active) {
+        stmt->predicate_node_count = stmt->where.node_count;
+        stmt->predicate_value_count = stmt->where.value_count;
+    }
+    return next;
 }
 
-/*
- * Parses one comma-separated list of index key names inside parentheses.
- */
-static const char *parse_key_list(const char *text, sql_statement *stmt)
+static const char *parse_having_clause_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
 {
+    sql_where_target target;
     const char *next;
 
-    text = skip_space(text);
-    if (*text++ != '(')
+    target.where = &stmt->having;
+    stmt->having_node_first = stmt->predicate_node_count;
+    stmt->having_value_first = stmt->predicate_value_count;
+    target.nodes = statement_having_nodes(stmt);
+    target.values = statement_having_values(stmt);
+    next = parse_predicate_clause_lexer(lexer, sql_keyword_having, stmt,
+        0, 0, &target);
+    if (!next) {
         return NULL;
+    }
+    if (stmt->having.active) {
+        stmt->predicate_node_count = (unsigned char)(
+            stmt->having_node_first + stmt->having.node_count);
+        stmt->predicate_value_count = (unsigned char)(
+            stmt->having_value_first + stmt->having.value_count);
+    }
+    return next;
+}
 
+static const char *parse_value_lexer(sql_lexer *lexer, sql_value *value);
+
+static const char *parse_insert_value_list_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
+{
+    sql_value value;
+    unsigned char index;
+
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
+        return NULL;
+    }
     while (1) {
-        text = skip_space(text);
-        if (stmt->key_count >= sql_max_columns)
+        if (stmt_assignment_count(stmt) >= sql_max_columns) {
             return NULL;
-
-        next = read_identifier(text, stmt->key_names[stmt->key_count]);
-        if (!next)
+        }
+        if (!parse_value_lexer(lexer, &value)) {
             return NULL;
-        stmt->key_count++;
-
-        text = skip_space(next);
-        if (*text == ',') {
-            text++;
+        }
+        if (stmt_assignments(stmt)[0].column_name[0] == '\0'
+            && stmt_assignment_count(stmt) == 0) {
+            stmt_assignments(stmt)[0].value = value;
+            stmt_assignment_count(stmt) = 1;
+        } else if (stmt_assignments(stmt)[0].column_name[0] == '\0') {
+            stmt_assignments(stmt)[stmt_assignment_count(stmt)]
+                .column_name[0] = '\0';
+            stmt_assignments(stmt)[stmt_assignment_count(stmt)].value = value;
+            stmt_assignment_count(stmt)++;
+        } else {
+            index = 0;
+            while (index < stmt_assignment_count(stmt)
+                && stmt_assignments(stmt)[index].value.type
+                    != sql_value_none) {
+                index++;
+            }
+            if (index >= stmt_assignment_count(stmt)) {
+                return NULL;
+            }
+            stmt_assignments(stmt)[index].value = value;
+        }
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
             continue;
         }
-        if (*text == ')')
-            return text + 1;
-        return NULL;
+        if (!lexer_accept_kind(lexer, sql_token_rparen)) {
+            return NULL;
+        }
+        if (stmt_assignments(stmt)[0].column_name[0] != '\0') {
+            for (index = 0; index < stmt_assignment_count(stmt); index++) {
+                if (stmt_assignments(stmt)[index].value.type
+                    == sql_value_none) {
+                    return NULL;
+                }
+            }
+        }
+        return lexer_position(lexer);
     }
 }
 
-/*
- * Parses one update assignment like column = value.
- */
-static const char *parse_assignment(const char *text, sql_assignment *asgn)
+static const char *parse_insert_column_list_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
 {
-    text = skip_space(text);
-    text = read_identifier(text, asgn->column_name);
-    if (!text)
+    unsigned char index;
+
+    if (!lexer_peek_kind(lexer, sql_token_lparen)) {
+        return lexer_position(lexer);
+    }
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
         return NULL;
-    text = skip_space(text);
-    if (*text++ != '=')
-        return NULL;
-    return parse_value(text, &asgn->value);
+    }
+    while (1) {
+        if (stmt_assignment_count(stmt) >= sql_max_columns) {
+            return NULL;
+        }
+        if (!lexer_accept_identifier(lexer,
+            stmt_assignments(stmt)[stmt_assignment_count(stmt)].column_name)) {
+            return NULL;
+        }
+        for (index = 0; index < stmt_assignment_count(stmt); index++) {
+            if (strcmp(stmt_assignments(stmt)[index].column_name,
+                stmt_assignments(stmt)[stmt_assignment_count(stmt)]
+                    .column_name) == 0) {
+                return NULL;
+            }
+        }
+        stmt_assignment_count(stmt)++;
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
+            continue;
+        }
+        return lexer_accept_kind(lexer, sql_token_rparen)
+            ? lexer_position(lexer) : NULL;
+    }
 }
 
-/*
- * Parses one comma-separated SET assignment list.
- */
-static const char *parse_assignment_list(const char *text, sql_statement *stmt)
+static const char *parse_key_list_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
 {
-    const char *next;
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
+        return NULL;
+    }
     while (1) {
-        if (stmt->assignment_count >= sql_max_columns)
+        if (stmt_key_count(stmt) >= sql_max_columns) {
             return NULL;
-        next = parse_assignment(text, &stmt->assignments[stmt->assignment_count]);
-        if (!next)
+        }
+        if (!lexer_accept_identifier(lexer,
+            stmt_key_names(stmt)[stmt_key_count(stmt)])) {
             return NULL;
-        stmt->assignment_count++;
-        text = skip_space(next);
-        if (*text != ',')
-            return text;
-        text++;
+        }
+        stmt_key_count(stmt)++;
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
+            continue;
+        }
+        return lexer_accept_kind(lexer, sql_token_rparen)
+            ? lexer_position(lexer) : NULL;
+    }
+}
+
+static const char *parse_assignment_lexer(sql_lexer *lexer,
+    sql_assignment *asgn)
+{
+    if (!lexer_accept_identifier(lexer, asgn->column_name)
+        || !lexer_accept_kind(lexer, sql_token_equal)) {
+        return NULL;
+    }
+    return parse_value_lexer(lexer, &asgn->value);
+}
+
+static const char *parse_assignment_list_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
+{
+    while (1) {
+        if (stmt_assignment_count(stmt) >= sql_max_columns) {
+            return NULL;
+        }
+        if (!parse_assignment_lexer(lexer,
+            &stmt_assignments(stmt)[stmt_assignment_count(stmt)])) {
+            return NULL;
+        }
+        stmt_assignment_count(stmt)++;
+        if (!lexer_accept_kind(lexer, sql_token_comma)) {
+            return lexer_position(lexer);
+        }
     }
 }
 
@@ -692,65 +1499,301 @@ static const char *parse_assignment_list(const char *text, sql_statement *stmt)
  * Parses one optional alias following a SELECT item or FROM table.
  * Supports both AS alias and bare alias forms.
  */
-static const char *parse_optional_alias(const char *text, char *alias,
-    const char *stop_keyword)
+static int keyword_matches_any(const sql_lexer *lexer,
+    const sql_keyword *keywords, unsigned char keyword_count)
 {
-    const char *next;
+    unsigned char index;
 
-    alias[0] = '\0';
-    text = skip_space(text);
-    if (keyword_matches(text, "AS")) {
-        text += 2;
-        text = skip_space(text);
-        return read_identifier(text, alias);
+    for (index = 0; index < keyword_count; index++) {
+        if (keywords[index] != sql_keyword_none
+            && lexer_peek_keyword(lexer, keywords[index])) {
+            return 1;
+        }
     }
-    if (stop_keyword && keyword_matches(text, stop_keyword)) {
-        return text;
-    }
-    next = read_identifier(text, alias);
-    if (!next) {
-        alias[0] = '\0';
-        return text;
-    }
-    return next;
+    return 0;
 }
 
-static const char *parse_optional_alias2(const char *text, char *alias,
-    const char *stop_keyword1, const char *stop_keyword2)
+static const char *parse_optional_alias(sql_lexer *lexer, char *alias,
+    const sql_keyword *stop_keywords, unsigned char stop_keyword_count)
 {
-    const char *next;
-
     alias[0] = '\0';
-    text = skip_space(text);
-    if (keyword_matches(text, "AS")) {
-        text += 2;
-        text = skip_space(text);
-        return read_identifier(text, alias);
+    if (lexer_accept_keyword(lexer, sql_keyword_as)) {
+        return lexer_accept_identifier(lexer, alias)
+            ? lexer_position(lexer) : NULL;
     }
-    if ((stop_keyword1 && keyword_matches(text, stop_keyword1))
-        || (stop_keyword2 && keyword_matches(text, stop_keyword2))) {
-        return text;
+    if (keyword_matches_any(lexer, stop_keywords, stop_keyword_count)) {
+        return lexer_position(lexer);
     }
-    next = read_identifier(text, alias);
-    if (!next) {
+    if (!lexer_accept_identifier(lexer, alias)) {
         alias[0] = '\0';
-        return text;
+        return lexer_position(lexer);
     }
-    return next;
+    return lexer_position(lexer);
+}
+
+static const sql_keyword from_alias_stop_keywords[] = {
+    sql_keyword_where, sql_keyword_join, sql_keyword_group,
+    sql_keyword_having
+};
+
+static const sql_keyword select_alias_stop_keywords[] = {
+    sql_keyword_from
+};
+
+static const sql_keyword join_alias_stop_keywords[] = {
+    sql_keyword_on
+};
+
+static const char *parse_select(sql_lexer *lexer, sql_statement *stmt);
+
+static const char *complete_named_statement(sql_lexer *lexer,
+    sql_statement *stmt, sql_statement_type type)
+{
+    if (!lexer_accept_identifier(lexer, stmt->name)) {
+        return NULL;
+    }
+    stmt->type = type;
+    return lexer_position(lexer);
+}
+
+static const char *parse_keyword_named_statement(sql_lexer *lexer,
+    sql_statement *stmt, sql_keyword keyword, sql_statement_type type)
+{
+    if (!lexer_accept_keyword(lexer, keyword)) {
+        return NULL;
+    }
+    return complete_named_statement(lexer, stmt, type);
+}
+
+static const char *complete_show_select(sql_lexer *lexer,
+    sql_statement *stmt, const char *table_name)
+{
+    stmt->type = sql_statement_select;
+    stmt_select_all(stmt) = 1;
+    copy_name(stmt->name, table_name);
+    return lexer_position(lexer);
+}
+
+static const char *parse_named_source_lexer(sql_lexer *lexer, char *table_name,
+    char *alias, const sql_keyword *stop_keywords,
+    unsigned char stop_keyword_count)
+{
+    if (!lexer_accept_identifier(lexer, table_name)) {
+        return NULL;
+    }
+    return parse_optional_alias(lexer, alias, stop_keywords,
+        stop_keyword_count);
+}
+
+static const char *parse_from_source_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
+{
+    if (lexer_peek_parenthesized_select(lexer)) {
+        if (!parse_parenthesized_select_body(lexer, stmt->subquery_text)) {
+            return NULL;
+        }
+        stmt_from_is_subquery(stmt) = 1;
+        strcpy(stmt->name, "_tmp");
+        return parse_optional_alias(lexer, stmt_from_alias(stmt),
+            from_alias_stop_keywords, 4);
+    }
+    return parse_named_source_lexer(lexer, stmt->name, stmt_from_alias(stmt),
+        from_alias_stop_keywords, 4);
+}
+
+static void init_scalar_expr(sql_scalar_expr *expr)
+{
+    memset(expr, 0, sizeof(*expr));
+    expr->kind = sql_scalar_expr_invalid;
+}
+
+static const char *parse_scalar_column_expr_lexer(sql_lexer *lexer,
+    const sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_scalar_expr *expr);
+
+static const char *parse_scalar_function_expr_lexer(sql_lexer *lexer,
+    sql_select_function function, sql_scalar_expr *expr)
+{
+    sql_scalar_expr argument;
+
+    init_scalar_expr(expr);
+    expr->kind = sql_scalar_expr_function;
+    expr->function = function;
+    expr->argument_is_star = 0;
+    if (!lexer_accept_kind(lexer, sql_token_lparen)) {
+        return NULL;
+    }
+    if (function == sql_function_count
+        && lexer_accept_kind(lexer, sql_token_star)) {
+        expr->argument_is_star = 1;
+        expr->column.qualifier[0] = '\0';
+        expr->column.name[0] = '\0';
+    } else {
+        if (!parse_scalar_column_expr_lexer(lexer, NULL, 0, 0, &argument)) {
+            return NULL;
+        }
+        copy_column_ref_name(&expr->column, argument.column.qualifier,
+            argument.column.name);
+    }
+    if (!lexer_accept_kind(lexer, sql_token_rparen)) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static const char *parse_scalar_expr_lexer(sql_lexer *lexer,
+    unsigned char allow_functions, sql_scalar_expr *expr)
+{
+    sql_select_function function;
+
+    init_scalar_expr(expr);
+    if (allow_functions
+        && lexer->token.kind == sql_token_identifier
+        && keyword_to_select_function(lexer->token.keyword, &function)) {
+        if (lexer_advance(lexer) != 0) {
+            return NULL;
+        }
+        return parse_scalar_function_expr_lexer(lexer, function, expr);
+    }
+
+    if (lexer->token.kind == sql_token_string) {
+        if (lexer->token.length <= 1
+            || lexer->token.length - 1 > sql_value_size) {
+            return NULL;
+        }
+        expr->kind = sql_scalar_expr_value;
+        expr->value.type = sql_value_string;
+        memcpy(expr->value.text, lexer->token.text + 1,
+            lexer->token.length - 2);
+        expr->value.text[lexer->token.length - 2] = '\0';
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    }
+    if (lexer->token.kind == sql_token_number) {
+        if (lexer->token.length + 1 > sql_value_size) {
+            return NULL;
+        }
+        expr->kind = sql_scalar_expr_value;
+        expr->value.type = sql_value_number;
+        memcpy(expr->value.text, lexer->token.text, lexer->token.length);
+        expr->value.text[lexer->token.length] = '\0';
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    }
+    if (lexer_peek_keyword(lexer, sql_keyword_null)) {
+        expr->kind = sql_scalar_expr_value;
+        expr->value.type = sql_value_null;
+        expr->value.text[0] = '\0';
+        return lexer_advance(lexer) == 0 ? lexer_position(lexer) : NULL;
+    }
+
+    expr->kind = sql_scalar_expr_column;
+    return lexer_accept_field_reference(lexer, expr->column.qualifier,
+        expr->column.name) ? lexer_position(lexer) : NULL;
+}
+
+static int scalar_expr_to_value(const sql_scalar_expr *expr,
+    sql_value *value)
+{
+    if (expr->kind == sql_scalar_expr_value) {
+        *value = expr->value;
+        return 0;
+    }
+    if (expr->kind == sql_scalar_expr_column) {
+        return encode_column_ref_value(&expr->column, value);
+    }
+    return -1;
+}
+
+static const char *parse_value_lexer(sql_lexer *lexer, sql_value *value)
+{
+    sql_scalar_expr expr;
+
+    if (!parse_scalar_expr_lexer(lexer, 0, &expr)
+        || scalar_expr_to_value(&expr, value) != 0) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static int scalar_expr_to_predicate_operand(const sql_scalar_expr *expr,
+    sql_predicate_operand *operand)
+{
+    memset(operand, 0, sizeof(*operand));
+    if (expr->kind == sql_scalar_expr_value) {
+        operand->kind = sql_predicate_operand_value;
+        operand->data.value = expr->value;
+        return 0;
+    }
+    if (expr->kind == sql_scalar_expr_column) {
+        operand->kind = sql_predicate_operand_column;
+        copy_column_ref_name(&operand->data.column,
+            expr->column.qualifier, expr->column.name);
+        return 0;
+    }
+    return -1;
+}
+
+static const char *parse_predicate_operand_lexer(sql_lexer *lexer,
+    sql_predicate_operand *operand)
+{
+    sql_scalar_expr expr;
+
+    if (!parse_scalar_expr_lexer(lexer, 0, &expr)
+        || scalar_expr_to_predicate_operand(&expr, operand) != 0) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static const char *parse_scalar_column_expr_lexer(sql_lexer *lexer,
+    const sql_statement *stmt, unsigned char source_count,
+    unsigned char allow_qualifier, sql_scalar_expr *expr)
+{
+    if (!parse_scalar_expr_lexer(lexer, 0, expr)
+        || expr->kind != sql_scalar_expr_column) {
+        return NULL;
+    }
+    if (stmt && !scalar_expr_column_matches_sources(expr, stmt,
+        source_count, allow_qualifier)) {
+        return NULL;
+    }
+    return lexer_position(lexer);
+}
+
+static int scalar_expr_to_select_item(const sql_scalar_expr *expr,
+    sql_select_item *item)
+{
+    memset(item, 0, sizeof(*item));
+    if (expr->kind == sql_scalar_expr_column) {
+        item->function = sql_function_none;
+        item->argument_is_star = 0;
+        copy_column_ref_name(&item->column, expr->column.qualifier,
+            expr->column.name);
+        return 0;
+    }
+    if (expr->kind == sql_scalar_expr_function) {
+        item->function = expr->function;
+        item->argument_is_star = expr->argument_is_star;
+        copy_column_ref_name(&item->column, expr->column.qualifier,
+            expr->column.name);
+        return 0;
+    }
+    return -1;
 }
 
 /*
  * Parses one projected column with an optional alias.
  */
-static const char *parse_select_item(const char *text, sql_select_item *item)
+static const char *parse_select_item_lexer(sql_lexer *lexer,
+    sql_select_item *item)
 {
-    text = skip_space(text);
-    text = read_field_reference(text, item->column.qualifier,
-        item->column.name);
-    if (!text) {
+    sql_scalar_expr expr;
+
+    if (!parse_scalar_expr_lexer(lexer, 1, &expr)
+        || scalar_expr_to_select_item(&expr, item) != 0) {
         return NULL;
     }
-    return parse_optional_alias(text, item->alias, "FROM");
+    return parse_optional_alias(lexer, item->alias,
+        select_alias_stop_keywords, 1);
 }
 
 /*
@@ -760,33 +1803,166 @@ static int normalize_select_items(sql_statement *stmt)
 {
     unsigned char index;
 
-    for (index = 0; index < stmt->select_count; index++) {
-        if (!qualifier_matches_tables(stmt->select_items[index]
-            .column.qualifier, stmt->name, stmt->from_alias,
-            stmt->join_table_name, stmt->join_alias)) {
+    for (index = 0; index < stmt_select_count(stmt); index++) {
+        if (stmt_select_items(stmt)[index].argument_is_star) {
+            continue;
+        }
+        if (!qualifier_matches_sources(stmt_select_items(stmt)[index]
+            .column.qualifier, stmt, statement_source_count(stmt))) {
             return -1;
         }
     }
     return 0;
 }
 
+static int group_item_present(const sql_statement *stmt,
+    const sql_column_ref *column)
+{
+    unsigned char index;
+
+    for (index = 0; index < stmt_group_count(stmt); index++) {
+        if (column_ref_matches(column, &stmt_group_items(stmt)[index])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int output_name_present(const sql_statement *stmt, const char *name)
+{
+    unsigned char index;
+
+    for (index = 0; index < stmt_select_count(stmt); index++) {
+        if (strcmp(select_item_output_name(&stmt_select_items(stmt)[index]),
+            name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int validate_having_names(const sql_statement *stmt)
+{
+    unsigned char stack[sql_where_max_nodes];
+    unsigned char depth;
+    unsigned char ref;
+    const sql_where_node *node;
+
+    if (!stmt->having.active) {
+        return 0;
+    }
+
+    depth = 0;
+    stack[depth++] = stmt->having.root;
+    while (depth > 0) {
+        ref = stack[--depth];
+        node = &statement_having_nodes(stmt)[ref];
+        switch (node->type) {
+        case sql_where_false:
+            break;
+        case sql_where_compare:
+        case sql_where_in:
+        case sql_where_like:
+        case sql_where_is_null:
+        case sql_where_quantified:
+            if (node->qualifier[0] != '\0'
+                || !output_name_present(stmt, node->column_name)) {
+                return -1;
+            }
+            break;
+        case sql_where_exists:
+            break;
+        case sql_where_not:
+            stack[depth++] = node->left;
+            break;
+        case sql_where_and:
+        case sql_where_or:
+            stack[depth++] = node->right;
+            stack[depth++] = node->left;
+            break;
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int validate_grouped_select(const sql_statement *stmt)
+{
+    unsigned char index;
+    int grouped;
+
+    grouped = stmt_group_count(stmt) > 0
+        || stmt_select_has_aggregate(stmt)
+        || stmt->having.active;
+    if (!grouped) {
+        return 0;
+    }
+
+    if (stmt_select_all(stmt) || stmt_select_count_star(stmt)) {
+        return -1;
+    }
+    if (stmt->having.active
+        && stmt_group_count(stmt) == 0
+        && !stmt_select_has_aggregate(stmt)) {
+        return -1;
+    }
+    for (index = 0; index < stmt_select_count(stmt); index++) {
+        if (select_item_is_aggregate(&stmt_select_items(stmt)[index])) {
+            continue;
+        }
+        if (!group_item_present(stmt, &stmt_select_items(stmt)[index].column)) {
+            return -1;
+        }
+    }
+
+    return validate_having_names(stmt);
+}
+
+static const char *parse_group_by_clause_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
+{
+    sql_scalar_expr expr;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_group)) {
+        return lexer_position(lexer);
+    }
+    if (!lexer_accept_keyword(lexer, sql_keyword_by)) {
+        return NULL;
+    }
+    while (1) {
+        if (stmt_group_count(stmt) >= sql_max_columns) {
+            return NULL;
+        }
+        if (!parse_scalar_column_expr_lexer(lexer, stmt,
+            statement_source_count(stmt), 1, &expr)) {
+            return NULL;
+        }
+        copy_column_ref_name(&stmt_group_items(stmt)[stmt_group_count(stmt)],
+            expr.column.qualifier, expr.column.name);
+        stmt_group_count(stmt)++;
+        if (!lexer_accept_kind(lexer, sql_token_comma)) {
+            return lexer_position(lexer);
+        }
+    }
+}
+
 /*
  * Adds the JOIN ON condition to the statement's WHERE tree as a regular
- * compare node. The right-hand column is encoded as a sql_value_identifier
- * with "qualifier.name" dot notation so the N-source WHERE evaluator can
- * resolve it against whichever source it belongs to at execution time.
+ * compare node. The right-hand column stays as a structured column
+ * operand so later flattening, optimization, and binding do not need
+ * to reconstruct it from text.
  */
 static const char *add_on_to_where(sql_statement *stmt,
     const char *left_qualifier, const char *left_name,
     const char *right_qualifier, const char *right_name)
 {
-    sql_where_node *wn;
-    sql_value *wv;
+    sql_where_target target;
+    sql_predicate_operand operand;
     unsigned char on_idx;
     unsigned char and_idx;
     unsigned char old_root;
-    unsigned short qlen;
-    unsigned short nlen;
 
     /* Need room for one compare node + possibly one AND node. */
     if ((unsigned short)stmt->where.node_count + 2 > sql_where_max_nodes) {
@@ -796,108 +1972,82 @@ static const char *add_on_to_where(sql_statement *stmt,
         return NULL;
     }
 
-    /* Build compare node: left_qualifier.left_name = identifier(rq.rn) */
-    on_idx = stmt->where.node_count;
-    wn = &stmt->where_nodes[on_idx];
-    memset(wn, 0, sizeof(*wn));
-    wn->type = sql_where_compare;
-    copy_name(wn->qualifier, left_qualifier);
-    copy_name(wn->column_name, left_name);
-    wn->operator = sql_compare_equal;
-    wn->value_first = stmt->where.value_count;
-    wn->value_count = 1;
-    stmt->where.node_count++;
-
-    /* Encode right-hand column as "qualifier.name" identifier. */
-    wv = &stmt->where_values[stmt->where.value_count];
-    wv->type = sql_value_identifier;
-    qlen = (unsigned short)strlen(right_qualifier);
-    nlen = (unsigned short)strlen(right_name);
-    if (right_qualifier[0] != '\0') {
-        if (qlen + 1 + nlen + 1 > sql_value_size) {
-            return NULL;
-        }
-        memcpy(wv->text, right_qualifier, qlen);
-        wv->text[qlen] = '.';
-        memcpy(wv->text + qlen + 1, right_name, nlen);
-        wv->text[qlen + 1 + nlen] = '\0';
-    } else {
-        strncpy(wv->text, right_name, sql_value_size - 1);
-        wv->text[sql_value_size - 1] = '\0';
+    target.where = &stmt->where;
+    target.nodes = stmt->where_nodes;
+    target.values = stmt->where_values;
+    memset(&operand, 0, sizeof(operand));
+    operand.kind = sql_predicate_operand_column;
+    copy_name(operand.data.column.qualifier, right_qualifier);
+    copy_name(operand.data.column.name, right_name);
+    if (make_compare_node(&target, left_qualifier, left_name,
+        sql_compare_equal, &operand, &on_idx) != 0) {
+        return NULL;
     }
-    stmt->where.value_count++;
 
     /* AND the ON condition with any existing WHERE clause. */
     if (stmt->where.active) {
         old_root = stmt->where.root;
-        and_idx = stmt->where.node_count;
-        wn = &stmt->where_nodes[and_idx];
-        memset(wn, 0, sizeof(*wn));
-        wn->type = sql_where_and;
-        wn->left = old_root;
-        wn->right = on_idx;
-        stmt->where.node_count++;
+        if (make_binary_node(&target, sql_where_and, old_root, on_idx,
+            &and_idx) != 0) {
+            return NULL;
+        }
         stmt->where.root = and_idx;
     } else {
         stmt->where.active = 1;
         stmt->where.root = on_idx;
     }
 
-    return (const char *)1; /* non-NULL = success */
+    return ""; /* non-NULL = success */
 }
 
-static const char *parse_join_condition(const char *text, sql_statement *stmt)
+static const char *parse_join_condition(sql_lexer *lexer, sql_statement *stmt,
+    unsigned char join_index)
 {
     char left_qualifier[sql_name_size];
     char left_name[sql_name_size];
     char right_qualifier[sql_name_size];
     char right_name[sql_name_size];
-    int left_is_left;
-    int left_is_right;
-    int right_is_left;
-    int right_is_right;
+    int left_is_existing;
+    int left_is_new;
+    int right_is_existing;
+    int right_is_new;
+    unsigned char existing_source_count;
 
-    text = skip_space(text);
-    if (!keyword_matches(text, "ON")) {
+    if (!lexer_accept_keyword(lexer, sql_keyword_on)) {
         return NULL;
     }
-    text += 2;
-    text = skip_space(text);
-    text = read_field_reference(text, left_qualifier, left_name);
-    if (!text || left_qualifier[0] == '\0') {
+    if (!lexer_accept_field_reference(lexer, left_qualifier, left_name)
+        || left_qualifier[0] == '\0') {
         return NULL;
     }
-    text = skip_space(text);
-    if (*text++ != '=') {
+    if (!lexer_accept_kind(lexer, sql_token_equal)) {
         return NULL;
     }
-    text = skip_space(text);
-    text = read_field_reference(text, right_qualifier, right_name);
-    if (!text || right_qualifier[0] == '\0') {
+    if (!lexer_accept_field_reference(lexer, right_qualifier, right_name)
+        || right_qualifier[0] == '\0') {
         return NULL;
     }
 
-    left_is_left  = qualifier_matches_source(left_qualifier,
-        stmt->name, stmt->from_alias);
-    left_is_right = qualifier_matches_source(left_qualifier,
-        stmt->join_table_name, stmt->join_alias);
-    right_is_left  = qualifier_matches_source(right_qualifier,
-        stmt->name, stmt->from_alias);
-    right_is_right = qualifier_matches_source(right_qualifier,
-        stmt->join_table_name, stmt->join_alias);
+    existing_source_count = (unsigned char)(1u + join_index);
+    left_is_existing = qualifier_matches_sources(left_qualifier, stmt,
+        existing_source_count);
+    left_is_new = qualifier_matches_pair(left_qualifier,
+        stmt_join_table_names(stmt)[join_index],
+        stmt_join_aliases(stmt)[join_index]);
+    right_is_existing = qualifier_matches_sources(right_qualifier, stmt,
+        existing_source_count);
+    right_is_new = qualifier_matches_pair(right_qualifier,
+        stmt_join_table_names(stmt)[join_index],
+        stmt_join_aliases(stmt)[join_index]);
 
-    /* Normalise so left side always belongs to the left table. Store the
-     * ON condition in join_left/right for now; it will be merged into the
-     * WHERE tree after parse_where_clause has run (in parse_select). */
-    if (left_is_left && right_is_right) {
-        copy_column_ref_name(&stmt->join_left,  left_qualifier,  left_name);
-        copy_column_ref_name(&stmt->join_right, right_qualifier, right_name);
-        return text;
+    /* Normalise so left side always belongs to the existing source set. */
+    if (left_is_existing && right_is_new) {
+        return add_on_to_where(stmt, left_qualifier, left_name,
+            right_qualifier, right_name) ? lexer_position(lexer) : NULL;
     }
-    if (left_is_right && right_is_left) {
-        copy_column_ref_name(&stmt->join_left,  right_qualifier, right_name);
-        copy_column_ref_name(&stmt->join_right, left_qualifier,  left_name);
-        return text;
+    if (left_is_new && right_is_existing) {
+        return add_on_to_where(stmt, right_qualifier, right_name,
+            left_qualifier, left_name) ? lexer_position(lexer) : NULL;
     }
 
     return NULL;
@@ -905,196 +2055,152 @@ static const char *parse_join_condition(const char *text, sql_statement *stmt)
 
 /*
  * Parses SELECT * or one comma-separated list of projected columns.
- * Also recognises COUNT(*) and sets select_count_star.
  */
-static const char *parse_select_list(const char *text, sql_statement *stmt)
+static const char *parse_select_list(sql_lexer *lexer, sql_statement *stmt)
 {
-    const char *next;
-
-    text = skip_space(text);
-    if (keyword_matches(text, "COUNT")) {
-        /* COUNT(*) and COUNT(n) are semantically identical — normalise both. */
-        text += 5;
-        text = skip_space(text);
-        if (*text++ != '(') return NULL;
-        text = skip_space(text);
-        while (*text && *text != ')' && *text != ',')
-            text++;
-        if (*text != ')') return NULL;
-        text++;
-        stmt->select_count_star = 1;
-        return text;
-    }
-    if (*text == '*') {
-        stmt->select_all = 1;
-        return text + 1;
+    if (lexer_accept_kind(lexer, sql_token_star)) {
+        stmt_select_all(stmt) = 1;
+        return lexer_position(lexer);
     }
     while (1) {
-        if (stmt->select_count >= sql_max_columns)
+        if (stmt_select_count(stmt) >= sql_max_columns) {
             return NULL;
-        next = parse_select_item(text, &stmt->select_items[stmt->select_count]);
-        if (!next)
+        }
+        if (!parse_select_item_lexer(lexer,
+            &stmt_select_items(stmt)[stmt_select_count(stmt)])) {
             return NULL;
-        stmt->select_count++;
-        text = skip_space(next);
-        if (*text != ',')
-            return text;
-        text = skip_space(text + 1);
+        }
+        if (select_item_is_aggregate(
+            &stmt_select_items(stmt)[stmt_select_count(stmt)])) {
+            stmt_select_has_aggregate(stmt) = 1;
+        }
+        stmt_select_count(stmt)++;
+        if (!lexer_accept_kind(lexer, sql_token_comma)) {
+            return lexer_position(lexer);
+        }
     }
+}
+
+/*
+ * Detects the special COUNT(*)-only form that still lowers to the
+ * compact count-only scan tree.
+ */
+static const char *try_parse_count_only(sql_lexer *lexer)
+{
+    sql_select_item item;
+    sql_lexer look;
+
+    memset(&item, 0, sizeof(item));
+    look = *lexer;
+    if (!parse_select_item_lexer(&look, &item)
+        || item.function != sql_function_count
+        || !item.argument_is_star
+        || item.alias[0] != '\0') {
+        return NULL;
+    }
+    if (!lexer_peek_keyword(&look, sql_keyword_from)) {
+        return NULL;
+    }
+    *lexer = look;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses USE name;
  */
-static const char *parse_use(const char *text, sql_statement *stmt)
+static const char *parse_use(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "USE"))
-        return NULL;
-    text += 3;
-    text = skip_space(text);
-    text = read_identifier(text, stmt->name);
-    if (!text)
-        return NULL;
-    stmt->type = sql_statement_use;
-    return text;
+    return parse_keyword_named_statement(lexer, stmt, sql_keyword_use,
+        sql_statement_use);
 }
 
 /*
  * Parses DROP DATABASE name; or DROP TABLE name;
  */
-static const char *parse_drop(const char *text, sql_statement *stmt)
+static const char *parse_drop(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "DROP"))
+    const char *text;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_drop)) {
         return NULL;
-    text += 4;
-    text = skip_space(text);
-    if (keyword_matches(text, "DATABASE")) {
-        text += 8;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text) return NULL;
-        stmt->type = sql_statement_drop_database;
+    }
+    text = parse_keyword_named_statement(lexer, stmt, sql_keyword_database,
+        sql_statement_drop_database);
+    if (text) {
         return text;
     }
-    if (keyword_matches(text, "TABLE")) {
-        text += 5;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text) return NULL;
-        stmt->type = sql_statement_drop_table;
+    text = parse_keyword_named_statement(lexer, stmt, sql_keyword_table,
+        sql_statement_drop_table);
+    if (text) {
         return text;
     }
-    if (keyword_matches(text, "VIEW")) {
-        text += 4;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text) return NULL;
-        stmt->type = sql_statement_drop_view;
-        return text;
-    }
-    return NULL;
+    return parse_keyword_named_statement(lexer, stmt, sql_keyword_view,
+        sql_statement_drop_view);
 }
 
 /*
  * Parses CREATE DATABASE, CREATE TABLE, or CREATE [UNIQUE] INDEX.
  */
-static const char *parse_create(const char *text, sql_statement *stmt)
+static const char *parse_create(sql_lexer *lexer, sql_statement *stmt)
 {
-    const char *next;
-    text = skip_space(text);
-    if (!keyword_matches(text, "CREATE"))
+    const char *text;
+    const char *sel_start;
+    char view_name[sql_name_size];
+    char view_text[sql_subquery_size];
+    unsigned short sel_len;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_create)) {
         return NULL;
-    text += 6;
-    text = skip_space(text);
-    if (keyword_matches(text, "DATABASE")) {
-        text += 8;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text)
-            return NULL;
-        stmt->type = sql_statement_create_database;
+    }
+    text = parse_keyword_named_statement(lexer, stmt, sql_keyword_database,
+        sql_statement_create_database);
+    if (text) {
         return text;
     }
-    if (keyword_matches(text, "TABLE")) {
-        text += 5;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text)
-            return NULL;
-        text = skip_space(text);
-        if (*text++ != '(')
-            return NULL;
-        while (1) {
-            if (stmt->column_count >= sql_max_columns)
-                return NULL;
-            next = parse_column(text, &stmt->columns[stmt->column_count]);
-            if (!next)
-                return NULL;
-            stmt->column_count++;
-            text = skip_space(next);
-            if (*text == ',') { text++; continue; }
-            if (*text == ')') {
-                stmt->type = sql_statement_create_table;
-                return text + 1;
-            }
+    if (lexer_accept_keyword(lexer, sql_keyword_table)) {
+        if (!lexer_accept_identifier(lexer, stmt->name)) {
             return NULL;
         }
+        stmt->type = sql_statement_create_table;
+        return parse_column_list_lexer(lexer, stmt);
     }
-    if (keyword_matches(text, "VIEW")) {
-        /* CREATE VIEW name AS SELECT ... */
-        const char *sel_start;
-        unsigned short sel_len;
-
-        text += 4;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text)
+    if (lexer_accept_keyword(lexer, sql_keyword_view)) {
+        if (!lexer_accept_identifier(lexer, stmt->name)
+            || !lexer_accept_keyword(lexer, sql_keyword_as)
+            || !lexer_peek_keyword(lexer, sql_keyword_select)) {
             return NULL;
-        text = skip_space(text);
-        if (!keyword_matches(text, "AS"))
+        }
+        copy_name(view_name, stmt->name);
+        sel_start = lexer_position(lexer);
+        text = parse_select(lexer, stmt);
+        if (!text) {
             return NULL;
-        text += 2;
-        text = skip_space(text);
-        if (!keyword_matches(text, "SELECT"))
-            return NULL;
-        sel_start = text;
-        /* Find the end: scan to ';' */
-        while (*text && *text != ';')
-            text++;
+        }
         sel_len = (unsigned short)(text - sel_start);
         if (sel_len == 0 || sel_len >= sql_subquery_size)
             return NULL;
-        memcpy(stmt->subquery_text, sel_start, sel_len);
-        stmt->subquery_text[sel_len] = '\0';
+        memcpy(view_text, sel_start, sel_len);
+        view_text[sel_len] = '\0';
+        sql_reset(stmt);
+        copy_name(stmt->name, view_name);
+        copy_subquery(stmt->subquery_text, view_text);
         stmt->type = sql_statement_create_view;
         return text;
     }
-    if (keyword_matches(text, "UNIQUE")) {
-        stmt->create_index_unique = 1;
-        text += 6;
-        text = skip_space(text);
+    if (lexer_accept_keyword(lexer, sql_keyword_unique)) {
+        stmt_index_unique(stmt) = 1;
     }
-    if (keyword_matches(text, "INDEX")) {
-        text += 5;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->name);
-        if (!text)
+    if (lexer_accept_keyword(lexer, sql_keyword_index)) {
+        if (!lexer_accept_identifier(lexer, stmt->name)
+            || !lexer_accept_keyword(lexer, sql_keyword_on)
+            || !lexer_accept_identifier(lexer, stmt->table_name)) {
             return NULL;
-        text = skip_space(text);
-        if (!keyword_matches(text, "ON"))
+        }
+        if (!parse_key_list_lexer(lexer, stmt) || stmt_key_count(stmt) == 0) {
             return NULL;
-        text += 2;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->table_name);
-        if (!text)
-            return NULL;
-        text = parse_key_list(text, stmt);
-        if (!text || stmt->key_count == 0)
-            return NULL;
+        }
         stmt->type = sql_statement_create_index;
-        return text;
+        return lexer_position(lexer);
     }
     return NULL;
 }
@@ -1104,24 +2210,16 @@ static const char *parse_create(const char *text, sql_statement *stmt)
  * SELECT * FROM sys_databases / sys_views at parse time.
  * This removes dedicated opcodes and lets the view pipeline handle output.
  */
-static const char *parse_show(const char *text, sql_statement *stmt)
+static const char *parse_show(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "SHOW"))
+    if (!lexer_accept_keyword(lexer, sql_keyword_show)) {
         return NULL;
-    text += 4;
-    text = skip_space(text);
-    if (keyword_matches(text, "DATABASES")) {
-        stmt->type = sql_statement_select;
-        stmt->select_all = 1;
-        strcpy(stmt->name, "sys_databases");
-        return text + 9;
     }
-    if (keyword_matches(text, "VIEWS")) {
-        stmt->type = sql_statement_select;
-        stmt->select_all = 1;
-        strcpy(stmt->name, "sys_views");
-        return text + 5;
+    if (lexer_accept_keyword(lexer, sql_keyword_databases)) {
+        return complete_show_select(lexer, stmt, "sys_databases");
+    }
+    if (lexer_accept_keyword(lexer, sql_keyword_views)) {
+        return complete_show_select(lexer, stmt, "sys_views");
     }
     return NULL;
 }
@@ -1129,198 +2227,229 @@ static const char *parse_show(const char *text, sql_statement *stmt)
 /*
  * Parses SELECT columns FROM table [JOIN table ON ...] [WHERE ...];
  */
-static const char *parse_select(const char *text, sql_statement *stmt)
+static const char *parse_select(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "SELECT"))
-        return NULL;
-    text += 6;
-    text = parse_select_list(text, stmt);
-    if (!text)
-        return NULL;
-    text = skip_space(text);
-    if (!keyword_matches(text, "FROM"))
-        return NULL;
-    text += 4;
-    text = skip_space(text);
-    if (*text == '(') {
-        /* FROM (SELECT ...) [AS alias] — inline subquery */
-        const char *inner_start;
-        unsigned short inner_len;
-        int depth;
-        const char *p;
+    const char *count_only_text;
+    const char *text;
 
-        text++;  /* skip '(' */
-        text = skip_space(text);
-        if (!keyword_matches(text, "SELECT"))
-            return NULL;
-        inner_start = text;
-        depth = 1;
-        p = text;
-        while (*p && depth > 0) {
-            if (*p == '(') depth++;
-            else if (*p == ')') { depth--; if (depth == 0) break; }
-            p++;
-        }
-        if (depth != 0) return NULL;
-        inner_len = (unsigned short)(p - inner_start);
-        if (inner_len == 0 || inner_len >= sql_subquery_size)
-            return NULL;
-        memcpy(stmt->subquery_text, inner_start, inner_len);
-        stmt->subquery_text[inner_len] = '\0';
-        stmt->from_is_subquery = 1;
-        strcpy(stmt->name, "_tmp");
-        text = p + 1;  /* skip ')' */
-        text = parse_optional_alias2(text, stmt->from_alias, "WHERE", "JOIN");
-    } else {
-        text = read_identifier(text, stmt->name);
-        if (!text)
-            return NULL;
-        text = parse_optional_alias2(text, stmt->from_alias, "WHERE", "JOIN");
-    }
-    if (!text)
+    if (!lexer_accept_keyword(lexer, sql_keyword_select)) {
         return NULL;
-    text = skip_space(text);
-    if (keyword_matches(text, "JOIN")) {
-        stmt->join_active = 1;
-        text += 4;
-        text = skip_space(text);
-        text = read_identifier(text, stmt->join_table_name);
-        if (!text) {
-            return NULL;
-        }
-        text = parse_optional_alias(text, stmt->join_alias, "ON");
-        if (!text) {
-            return NULL;
-        }
-        text = parse_join_condition(text, stmt);
+    }
+    if (lexer_accept_keyword(lexer, sql_keyword_distinct)) {
+        stmt_select_distinct(stmt) = 1;
+    } else {
+        (void)lexer_accept_keyword(lexer, sql_keyword_all);
+    }
+    count_only_text = try_parse_count_only(lexer);
+    if (count_only_text != NULL) {
+        stmt_select_count_star(stmt) = 1;
+    } else {
+        text = parse_select_list(lexer, stmt);
         if (!text) {
             return NULL;
         }
     }
-    if (!stmt->select_all && !stmt->select_count_star
+    if (!lexer_accept_keyword(lexer, sql_keyword_from)) {
+        return NULL;
+    }
+    text = parse_from_source_lexer(lexer, stmt);
+    if (!text) {
+        return NULL;
+    }
+    while (lexer_peek_kind(lexer, sql_token_comma)
+        || lexer_peek_keyword(lexer, sql_keyword_join)) {
+        unsigned char join_index;
+
+        if (stmt_join_count(stmt) >= sql_max_joins) {
+            return NULL;
+        }
+        join_index = stmt_join_count(stmt);
+        if (lexer_accept_kind(lexer, sql_token_comma)) {
+            text = parse_named_source_lexer(lexer,
+                stmt_join_table_names(stmt)[join_index],
+                stmt_join_aliases(stmt)[join_index],
+                from_alias_stop_keywords, 4);
+            if (!text) {
+                return NULL;
+            }
+        } else {
+            if (!lexer_accept_keyword(lexer, sql_keyword_join)) {
+                return NULL;
+            }
+            text = parse_named_source_lexer(lexer,
+                stmt_join_table_names(stmt)[join_index],
+                stmt_join_aliases(stmt)[join_index],
+                join_alias_stop_keywords, 1);
+            if (!text) {
+                return NULL;
+            }
+            text = parse_join_condition(lexer, stmt, join_index);
+            if (!text) {
+                return NULL;
+            }
+        }
+        stmt_join_count(stmt)++;
+    }
+    if (!stmt_select_all(stmt) && !stmt_select_count_star(stmt)
         && normalize_select_items(stmt) != 0) {
         return NULL;
     }
-    text = parse_where_clause(text, stmt, stmt->name, stmt->from_alias,
-        stmt->join_table_name, stmt->join_alias, 1);
-    if (!text)
+    text = parse_where_clause_lexer(lexer, stmt, statement_source_count(stmt),
+        1);
+    if (!text) {
         return NULL;
-    /* Merge the JOIN ON condition into the WHERE tree now that the
-     * regular WHERE clause has been parsed (parse_where_clause resets
-     * node counts, so we add the ON condition after it). */
-    if (stmt->join_active && stmt->join_left.name[0] != '\0') {
-        if (!add_on_to_where(stmt,
-            stmt->join_left.qualifier,  stmt->join_left.name,
-            stmt->join_right.qualifier, stmt->join_right.name)) {
-            return NULL;
-        }
+    }
+    text = parse_group_by_clause_lexer(lexer, stmt);
+    if (!text) {
+        return NULL;
+    }
+    text = parse_having_clause_lexer(lexer, stmt);
+    if (!text) {
+        return NULL;
+    }
+    if (validate_grouped_select(stmt) != 0) {
+        return NULL;
     }
     stmt->type = sql_statement_select;
-    return text;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses INSERT INTO table VALUES (value[, value ...]);
  */
-static const char *parse_insert(const char *text, sql_statement *stmt)
+static const char *parse_insert(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "INSERT"))
+    const char *text;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_insert)
+        || !lexer_accept_keyword(lexer, sql_keyword_into)
+        || !lexer_accept_identifier(lexer, stmt->name)) {
         return NULL;
-    text += 6;
-    text = skip_space(text);
-    if (!keyword_matches(text, "INTO"))
+    }
+    text = parse_insert_column_list_lexer(lexer, stmt);
+    if (!text) {
         return NULL;
-    text += 4;
-    text = skip_space(text);
-    text = read_identifier(text, stmt->name);
-    if (!text)
+    }
+    if (!lexer_accept_keyword(lexer, sql_keyword_values)) {
         return NULL;
-    text = skip_space(text);
-    if (!keyword_matches(text, "VALUES"))
+    }
+    text = parse_insert_value_list_lexer(lexer, stmt);
+    if (!text || stmt_assignment_count(stmt) == 0) {
         return NULL;
-    text += 6;
-    text = parse_value_list(text, stmt);
-    if (!text || stmt->value_count == 0)
-        return NULL;
+    }
     stmt->type = sql_statement_insert;
-    return text;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses UPDATE table SET column = value[, ...] [WHERE ...];
  */
-static const char *parse_update(const char *text, sql_statement *stmt)
+static const char *parse_update(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "UPDATE"))
+    const char *text;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_update)
+        || !lexer_accept_identifier(lexer, stmt->name)
+        || !lexer_accept_keyword(lexer, sql_keyword_set)) {
         return NULL;
-    text += 6;
-    text = skip_space(text);
-    text = read_identifier(text, stmt->name);
-    if (!text)
+    }
+    text = parse_assignment_list_lexer(lexer, stmt);
+    if (!text || stmt_assignment_count(stmt) == 0) {
         return NULL;
-    text = skip_space(text);
-    if (!keyword_matches(text, "SET"))
+    }
+    text = parse_where_clause_lexer(lexer, stmt, 1, 0);
+    if (!text) {
         return NULL;
-    text += 3;
-    text = skip_space(text);
-    text = parse_assignment_list(text, stmt);
-    if (!text || stmt->assignment_count == 0)
-        return NULL;
-    text = parse_where_clause(text, stmt, stmt->name, "", "", "", 0);
-    if (!text)
-        return NULL;
+    }
     stmt->type = sql_statement_update;
-    return text;
+    return lexer_position(lexer);
 }
 
 /*
  * Parses DELETE FROM table [WHERE column op value];
  */
-static const char *parse_delete(const char *text, sql_statement *stmt)
+static const char *parse_delete(sql_lexer *lexer, sql_statement *stmt)
 {
-    text = skip_space(text);
-    if (!keyword_matches(text, "DELETE"))
+    const char *text;
+
+    if (!lexer_accept_keyword(lexer, sql_keyword_delete)
+        || !lexer_accept_keyword(lexer, sql_keyword_from)
+        || !lexer_accept_identifier(lexer, stmt->name)) {
         return NULL;
-    text += 6;
-    text = skip_space(text);
-    if (!keyword_matches(text, "FROM"))
+    }
+    text = parse_where_clause_lexer(lexer, stmt, 1, 0);
+    if (!text) {
         return NULL;
-    text += 4;
-    text = skip_space(text);
-    text = read_identifier(text, stmt->name);
-    if (!text)
-        return NULL;
-    text = parse_where_clause(text, stmt, stmt->name, "", "", "", 0);
-    if (!text)
-        return NULL;
+    }
     stmt->type = sql_statement_delete;
-    return text;
+    return lexer_position(lexer);
+}
+
+static const char *parse_statement_lexer(sql_lexer *lexer,
+    sql_statement *stmt)
+{
+    switch (lexer->token.keyword) {
+    case sql_keyword_create:
+        return parse_create(lexer, stmt);
+    case sql_keyword_show:
+        return parse_show(lexer, stmt);
+    case sql_keyword_use:
+        return parse_use(lexer, stmt);
+    case sql_keyword_drop:
+        return parse_drop(lexer, stmt);
+    case sql_keyword_select:
+        return parse_select(lexer, stmt);
+    case sql_keyword_insert:
+        return parse_insert(lexer, stmt);
+    case sql_keyword_update:
+        return parse_update(lexer, stmt);
+    case sql_keyword_delete:
+        return parse_delete(lexer, stmt);
+    default:
+        break;
+    }
+    return NULL;
 }
 
 int sql_parse_statement(const char *text, sql_statement *stmt)
 {
+    sql_lexer lexer;
     const char *next;
-    const char *p;
 
     sql_reset(stmt);
-    p = skip_space(text);
+    if (lexer_init(&lexer, text) != 0
+        || lexer.token.kind != sql_token_identifier) {
+        return -1;
+    }
 
-    if      (keyword_matches(p, "CREATE")) next = parse_create(text, stmt);
-    else if (keyword_matches(p, "SHOW"))   next = parse_show(text, stmt);
-    else if (keyword_matches(p, "USE"))    next = parse_use(text, stmt);
-    else if (keyword_matches(p, "DROP"))   next = parse_drop(text, stmt);
-    else if (keyword_matches(p, "SELECT")) next = parse_select(text, stmt);
-    else if (keyword_matches(p, "INSERT")) next = parse_insert(text, stmt);
-    else if (keyword_matches(p, "UPDATE")) next = parse_update(text, stmt);
-    else if (keyword_matches(p, "DELETE")) next = parse_delete(text, stmt);
-    else                                   return -1;
+    next = parse_statement_lexer(&lexer, stmt);
+    if (!next) {
+        return -1;
+    }
+    if (lexer_reposition(&lexer, next) != 0
+        || !lexer_accept_kind(&lexer, sql_token_semicolon)) {
+        return -1;
+    }
+    return lexer.token.kind == sql_token_eof ? 0 : -1;
+}
 
-    if (!next) return -1;
-    next = skip_space(next);
-    if (*next != ';') return -1;
-    next = skip_space(next + 1);
-    return *next != '\0' ? -1 : 0;
+int sql_parse_select_body(const char *text, sql_statement *stmt)
+{
+    sql_lexer lexer;
+    const char *next;
+
+    sql_reset(stmt);
+    if (lexer_init(&lexer, text) != 0
+        || lexer.token.keyword != sql_keyword_select) {
+        return -1;
+    }
+
+    next = parse_statement_lexer(&lexer, stmt);
+    if (!next || stmt->type != sql_statement_select) {
+        return -1;
+    }
+    if (lexer_reposition(&lexer, next) != 0) {
+        return -1;
+    }
+    return lexer.token.kind == sql_token_eof ? 0 : -1;
 }

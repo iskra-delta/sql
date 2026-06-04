@@ -24,6 +24,7 @@
 #define index_catalog_path "../bin/sql_index_root/sys/ndx.dbf"
 #define people_table_path "../bin/sql_index_root/1/people.dbf"
 #define cities_table_path "../bin/sql_index_root/1/cities.dbf"
+#define regions_table_path "../bin/sql_index_root/1/regions.dbf"
 #define name_index_path "../bin/sql_index_root/1/name_idx.ndx"
 #define city_name_index_path "../bin/sql_index_root/1/city_name.ndx"
 
@@ -113,8 +114,10 @@ static void cleanup_files(void)
     unlink(city_name_index_path);
     unlink(people_table_path);
     unlink(cities_table_path);
+    unlink(regions_table_path);
     unlink(index_catalog_path);
     unlink("../bin/sql_index_root/sys/db.dbf");
+    unlink("../bin/sql_index_root/sys/vw.dbf");
     rmdir("../bin/sql_index_root/sys");
     rmdir("../bin/sql_index_root/1");
     rmdir(test_root_path);
@@ -541,6 +544,25 @@ static int test_select_logic_in(void)
     return 0;
 }
 
+static int test_select_same_source_column_compare(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "SELECT name FROM people WHERE age = age;\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("amy")
+        || !output_contains("2 rows")) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int test_select_join(void)
 {
     const char *commands =
@@ -559,6 +581,288 @@ static int test_select_join(void)
         || !output_contains("zoe | London")
         || output_contains("amy | New York")
         || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_select_table_list(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "SELECT p.name, c.title FROM people AS p, cities c "
+        "WHERE p.city = c.code AND c.region = 'EU';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe | London")
+        || output_contains("amy | New York")
+        || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_select_multi_join_and_long_where(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "CREATE TABLE regions (code CHAR(2), name CHAR(16), zone CHAR(1));\n"
+        "INSERT INTO regions VALUES ('EU', 'Europe', 'W');\n"
+        "INSERT INTO regions VALUES ('US', 'America', 'E');\n"
+        "SELECT p.name, c.title, r.name FROM people AS p "
+        "JOIN cities c ON p.city = c.code "
+        "JOIN regions r ON c.region = r.code "
+        "WHERE p.age >= 18 AND c.region = 'EU' AND r.zone = 'W' "
+        "AND p.name = 'zoe';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!file_exists(regions_table_path)
+        || !output_contains("zoe | London | Europe")
+        || output_contains("amy | New York | America")
+        || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_select_group_and_trim(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "INSERT INTO people VALUES ('ian', 'LON', 24);\n"
+        "SELECT TRIM(name) AS clean FROM people WHERE city = 'LON' "
+        "AND age = 24;\n"
+        "SELECT c.region, MAX(p.age) AS max_age, AVG(p.age) AS avg_age "
+        "FROM people AS p JOIN cities c ON p.city = c.code "
+        "GROUP BY c.region HAVING max_age > 21;\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("ian")
+        || !output_contains("EU | 24 | 21")
+        || output_contains("US | 21 | 21")
+        || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_insert_column_list(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "INSERT INTO cities (title, code, region) "
+        "VALUES ('Paris', 'PAR', 'EU');\n"
+        "SELECT title FROM cities WHERE code = 'PAR';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("Paris")
+        || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_null_predicates(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "UPDATE people SET city = NULL WHERE name = 'zoe';\n"
+        "SELECT name FROM people WHERE city IS NULL;\n"
+        "SELECT name FROM people WHERE city IS NOT NULL;\n"
+        "SELECT name FROM people WHERE city = NULL;\n"
+        "SELECT name FROM people WHERE NOT city = NULL;\n"
+        "SELECT name FROM people WHERE city = NULL OR name = 'amy';\n"
+        "SELECT name FROM people WHERE city = NULL AND name = 'amy';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("amy")
+        || !output_contains("ian")
+        || !output_contains("2 rows")
+        || !output_contains("1 row")
+        || !output_contains("0 rows")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_subquery_predicates(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "SELECT name FROM people WHERE EXISTS "
+        "(SELECT code FROM cities WHERE region = 'EU');\n"
+        "SELECT name FROM people WHERE city = ANY "
+        "(SELECT code FROM cities WHERE region = 'US');\n"
+        "SELECT name FROM people WHERE city IN "
+        "(SELECT code FROM cities WHERE region = 'EU');\n"
+        "SELECT name FROM people WHERE age >= ALL "
+        "(SELECT age FROM people WHERE city IS NOT NULL);\n"
+        "SELECT name FROM people WHERE age > ALL "
+        "(SELECT age FROM people WHERE city = 'ZZZ');\n"
+        "SELECT name FROM people WHERE age = ANY "
+        "(SELECT age FROM people WHERE city = 'ZZZ');\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("amy")
+        || !output_contains("ian")
+        || !output_contains("3 rows")
+        || !output_contains("1 row")
+        || !output_contains("0 rows")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_exists_multi_column_subquery(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "SELECT name FROM people WHERE EXISTS "
+        "(SELECT code, region FROM cities WHERE region = 'EU');\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("amy")
+        || !output_contains("ian")
+        || !output_contains("3 rows")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_select_distinct_aggregates_and_predicates(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "SELECT DISTINCT city FROM people WHERE age BETWEEN 18 AND 24;\n"
+        "SELECT city, COUNT(*) AS total, MIN(age) AS min_age, "
+        "SUM(age) AS sum_age FROM people "
+        "WHERE NOT city LIKE 'N%' AND age BETWEEN 18 AND 24 "
+        "GROUP BY city HAVING total > 1;\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("LON")
+        || !output_contains("NYC")
+        || !output_contains("2 rows")
+        || !output_contains("LON | 2 | 18 | 42")
+        || output_contains("NYC | 1 | 21 | 21")
+        || !output_contains("1 row")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_simple_view_flattening(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "CREATE VIEW adult_people AS "
+        "SELECT * FROM people p WHERE p.age >= 18;\n"
+        "SELECT name FROM adult_people WHERE city = 'LON';\n"
+        "SELECT a.name, c.title FROM adult_people a "
+        "JOIN cities c ON a.city = c.code WHERE c.region = 'EU';\n"
+        "UPDATE adult_people SET city = 'LON' WHERE name = 'zoe';\n"
+        "SELECT city FROM people WHERE name = 'zoe';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("ian")
+        || !output_contains("zoe | London")
+        || !output_contains("ian | London")
+        || !output_contains("1 updated")
+        || !output_contains("LON")
+        || output_contains("amy | New York")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_projected_view_flattening(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "CREATE VIEW adult_names AS "
+        "SELECT name AS person, city AS home FROM people p "
+        "WHERE p.age >= 18;\n"
+        "SELECT person FROM adult_names WHERE home = 'LON';\n"
+        "SELECT a.person, c.title FROM adult_names a "
+        "JOIN cities c ON a.home = c.code WHERE c.region = 'EU';\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe")
+        || !output_contains("ian")
+        || !output_contains("zoe | London")
+        || !output_contains("ian | London")
+        || !output_contains("2 rows")
+        || output_contains("amy | New York")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_nested_view_materialization(void)
+{
+    const char *commands =
+        "USE demo;\n"
+        "CREATE VIEW adult_names_2 AS "
+        "SELECT name AS person, city AS home FROM people p "
+        "WHERE p.age >= 18;\n"
+        "CREATE VIEW eu_adult_names AS "
+        "SELECT a.person, c.title FROM adult_names_2 a "
+        "JOIN cities c ON a.home = c.code WHERE c.region = 'EU';\n"
+        "SELECT person, title FROM eu_adult_names;\n";
+
+    if (run_shell_script(commands) != 0) {
+        return 1;
+    }
+
+    if (!output_contains("zoe | London")
+        || !output_contains("ian | London")
+        || !output_contains("2 rows")
+        || output_contains("amy | New York")) {
         return 1;
     }
 
@@ -587,8 +891,80 @@ int main(void)
         return 1;
     }
 
+    if (test_select_same_source_column_compare() != 0) {
+        printf("test_sql_exec: select same-source column compare fail\n");
+        cleanup_files();
+        return 1;
+    }
+
     if (test_select_join() != 0) {
         printf("test_sql_exec: select join fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_select_table_list() != 0) {
+        printf("test_sql_exec: select table list fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_select_multi_join_and_long_where() != 0) {
+        printf("test_sql_exec: select multi join fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_select_group_and_trim() != 0) {
+        printf("test_sql_exec: select group fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_insert_column_list() != 0) {
+        printf("test_sql_exec: insert column list fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_select_distinct_aggregates_and_predicates() != 0) {
+        printf("test_sql_exec: select distinct fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_simple_view_flattening() != 0) {
+        printf("test_sql_exec: simple view flatten fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_projected_view_flattening() != 0) {
+        printf("test_sql_exec: projected view flatten fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_nested_view_materialization() != 0) {
+        printf("test_sql_exec: nested view materialization fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_null_predicates() != 0) {
+        printf("test_sql_exec: null predicates fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_subquery_predicates() != 0) {
+        printf("test_sql_exec: subquery predicates fail\n");
+        cleanup_files();
+        return 1;
+    }
+
+    if (test_exists_multi_column_subquery() != 0) {
+        printf("test_sql_exec: exists multi-column fail\n");
         cleanup_files();
         return 1;
     }

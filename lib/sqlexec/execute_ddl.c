@@ -8,7 +8,7 @@
  */
 
 #include "exec_impl.h"
-#include "../shared/metacache.h"
+#include "metacache.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -252,16 +252,16 @@ static int execute_create_table(sqlexec_env *env,
     }
     for (index = 0; index < table_def->columns.count; index++) {
         strcpy(fields[index].name,
-            env->program->columns[
+            program_columns(env->program)[
                 table_def->columns.first + index].name);
         fields[index].type =
-            env->program->columns[
+            program_columns(env->program)[
                 table_def->columns.first + index].dbf_type;
         fields[index].length =
-            env->program->columns[
+            program_columns(env->program)[
                 table_def->columns.first + index].length;
         fields[index].decimals =
-            env->program->columns[
+            program_columns(env->program)[
                 table_def->columns.first + index].decimals;
     }
     if (dbf_create(&file, table_path, fields,
@@ -366,7 +366,7 @@ static int execute_create_view(sqlexec_env *env,
         return -1;
     }
     if (register_view(env->root, env->current_db, name, 'U',
-        env->program->subquery_text) != 0) {
+        program_subquery_text(env->program)) != 0) {
         return -1;
     }
     ddl_write_str(env, "created view ");
@@ -396,10 +396,6 @@ static int execute_drop_view(sqlexec_env *env, const char *name)
 int exec_ddl(sqlexec_env *env)
 {
     const sqlexec_node *root_node;
-    const sqlexec_node *first_node;
-    const sqlexec_node *second_node;
-    sqlexec_ref first_ref;
-    sqlexec_ref second_ref;
 
     root_node = sqlexec_get_const(env->program, env->program->root);
     if (!root_node) {
@@ -411,52 +407,18 @@ int exec_ddl(sqlexec_env *env)
         return execute_create_database(env, root_node->data.named.name);
     case sqlexec_use_database:
         return execute_use(env, root_node->data.named.name);
+    case sqlexec_drop_database:
+        return execute_drop_database(env, root_node->data.named.name);
     case sqlexec_create_table:
         return execute_create_table(env, &root_node->data.table);
+    case sqlexec_drop_table:
+        return execute_drop_table(env, root_node->data.named.name);
+    case sqlexec_create_index:
+        return execute_create_index(env, &root_node->data.index);
     case sqlexec_create_view:
         return execute_create_view(env, root_node->data.named.name);
     case sqlexec_drop_view:
         return execute_drop_view(env, root_node->data.named.name);
-    case sqlexec_sequence:
-        break;
-    default:
-        return -1;
-    }
-
-    /* Sequence root: first child determines the DDL operation. */
-    first_ref = env->program->nodes[env->program->root].first_child;
-    if (first_ref == sqlexec_nil) {
-        return -1;
-    }
-    first_node = sqlexec_get_const(env->program, first_ref);
-    if (!first_node) {
-        return -1;
-    }
-    second_ref = first_node->next_sibling;
-    second_node = second_ref != sqlexec_nil
-        ? sqlexec_get_const(env->program, second_ref) : NULL;
-
-    switch (first_node->opcode) {
-    case sqlexec_build_index:
-        if (!second_node
-            || second_node->opcode != sqlexec_register_index) {
-            return -1;
-        }
-        return execute_create_index(env, &first_node->data.index);
-    case sqlexec_unregister_table_indexes:
-        if (!second_node
-            || second_node->opcode != sqlexec_drop_table) {
-            return -1;
-        }
-        return execute_drop_table(env,
-            second_node->data.named.name);
-    case sqlexec_unregister_database_indexes:
-        if (!second_node
-            || second_node->opcode != sqlexec_drop_database) {
-            return -1;
-        }
-        return execute_drop_database(env,
-            second_node->data.named.name);
     default:
         return -1;
     }

@@ -16,9 +16,8 @@
 /*
  * Rewrites one lowered tree using conservative catalog-driven rules.
  * The current pass checks the registered index catalog for the active
- * database and may replace table_scan leaves under filter nodes with
- * index_scan_eq or index_scan_range. Returns zero on success and -1 on
- * failure.
+ * database and may annotate table_scan leaves with index-backed
+ * equality or range access. Returns zero on success and -1 on failure.
  */
 int sqlopt_optimize(sqlexec_program *program, const char *root,
     const char *db_name);

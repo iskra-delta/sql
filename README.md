@@ -50,10 +50,12 @@ CREATE VIEW name AS SELECT ...;
 DROP VIEW name;
 SHOW VIEWS;
 
-SELECT * | col... | COUNT(*) | COUNT(n) FROM table|view|(SELECT...)
-  [JOIN table ON col = col]
-  [WHERE expr];
-INSERT INTO table VALUES (val [, val ...]);
+SELECT [ALL|DISTINCT] select_list FROM from_item
+  [{, from_item} | {JOIN table ON col = col}]...
+  [WHERE expr]
+  [GROUP BY col [, col ...]]
+  [HAVING expr];
+INSERT INTO table [(col [, col ...])] VALUES (val [, val ...]);
 UPDATE table SET col = val [, ...] [WHERE expr];
 DELETE FROM table [WHERE expr];
 ```
@@ -61,12 +63,38 @@ DELETE FROM table [WHERE expr];
 Column types: `CHAR(n)`, `CHARACTER(n)`, `NUMERIC(n[,d])`, `DATE`,
 `LOGICAL`.
 
-WHERE supports `AND`, `OR`, `IN (...)`, nested parentheses, and the
-comparison operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`.
+Supported SELECT functions:
+- scalar: `TRIM(col)`
+- aggregate: `COUNT(*)`, `COUNT(col)`, `MIN(col)`, `MAX(col)`,
+  `SUM(col)`, `AVG(col)`
 
-The JOIN `ON` condition is merged into the WHERE tree at parse time,
-so a single N-source evaluator handles both join equality and filter
-predicates with no special-case code in the executor.
+The `NULL` literal is accepted in `INSERT`, `UPDATE`, and predicate
+comparisons.
+
+WHERE supports `AND`, `OR`, `NOT`, `IN (...)`, `IN (SELECT ...)`,
+`BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`, `EXISTS (SELECT ...)`,
+quantified comparisons with `ANY` / `ALL`, nested parentheses, the
+comparison operators `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, and
+qualified column-to-column comparisons such as `p.city = c.code` in
+multi-source queries.
+
+SELECT supports up to 4 total row sources across comma-separated table
+lists and/or 3 INNER JOIN clauses.
+Grouped SELECT and `SELECT DISTINCT` each keep up to 8 in-memory result
+rows. `HAVING` reuses the comparison syntax from `WHERE`, but
+references projected output names or aliases rather than base-table
+qualifiers. `AVG` currently uses integer arithmetic.
+Predicate subqueries are limited to uncorrelated single-column SELECTs.
+They are materialised before the outer scan, with up to 8 predicate
+subqueries and up to 32 cached rows per predicate subquery.
+
+`NULL` currently maps to a blank DBF field. That is enough for
+three-valued predicate logic, but blank character data and `NULL` are
+not yet distinguished as separate stored values.
+
+Qualified multi-source `WHERE` comparisons and JOIN `ON` conditions are
+both evaluated through one shared N-source WHERE path, so the executor
+does not need separate old-style-vs-modern join logic.
 
 Identifiers and keywords are case-insensitive. Every statement ends
 with `;`.
@@ -104,9 +132,14 @@ callback. On CP/M this struct will sit at a fixed address in the
 resident kernel; each phase binary can be loaded separately and called
 via a single `module_run(sql_context *)` entry point.
 
-Subqueries and views are materialised to a temp table (`_tmp.dbf` in
+Simple base-table views and simple inline subqueries over one base
+table may flatten during lowering when it is safe to do so, including
+plain projected column lists with aliases. More complex FROM
+subqueries and views are materialised to a temp table (`_tmp.dbf` in
 the current database directory) before the outer query runs. The temp
-file is removed after the outer query closes.
+file is removed after the outer query closes. Predicate subqueries
+(`EXISTS`, `IN (SELECT ...)`, `op ANY (...)`, `op ALL (...)`) are
+collected into bounded in-memory caches before the outer scan begins.
 
 ### Optimizer
 
@@ -150,10 +183,11 @@ the executor.
 | `include/` | public headers |
 | `lib/dbf/` | DBF storage library |
 | `lib/ndx/` | dBase III B-tree index library |
-| `lib/shared/` | catalog, table, WHERE helpers shared by all phases |
+| `lib/common/` | phase-neutral utility helpers |
+| `lib/catalog/` | catalog and table-access infrastructure |
 | `lib/sql/` | SQL parser and execution-tree builder |
 | `lib/sqlopt/` | catalog-driven query optimizer |
-| `lib/sqlexec/` | execution-tree executor |
+| `lib/sqlexec/` | execution-tree executor and runtime-only support |
 | `docs/` | design and reference documentation |
 | `tests/` | automated tests |
 | `build/` | compiler outputs |
@@ -168,6 +202,8 @@ the executor.
 | `docs/DBF.md` | DBF wire format and API reference |
 | `docs/NDX.md` | NDX wire format and API reference |
 | `docs/MODULES.md` | module architecture for CP/M overlay loading |
+| `docs/OPTIMIZATION.md` | optimization close-out note and optional follow-up ideas |
+| `docs/STANDARD86.md` | implementation prompt and gap analysis for SQL-86 |
 | `docs/REFACTORING.md` | refactoring record and rationale |
 
 ## Limits
@@ -177,10 +213,16 @@ the executor.
 | Databases per root | 15 |
 | Columns per table | 16 |
 | Identifier length | 16 characters |
-| Value text length | 32 characters |
+| Value text length | 33 characters |
 | Plan nodes per statement | 20 |
-| Pooled names per plan | 24 |
-| WHERE nodes per statement | 16 |
+| Pooled names per plan | 64 |
+| Row sources per SELECT | 4 |
+| JOIN clauses per SELECT | 3 |
+| WHERE nodes per statement | 48 |
+| WHERE values per statement | 32 |
+| HAVING nodes per statement | 48 |
+| HAVING values per statement | 32 |
+| Distinct groups or DISTINCT rows per SELECT | 8 |
 | Maximum record buffer | 4096 bytes |
 
 ## Shell Keys

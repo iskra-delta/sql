@@ -895,6 +895,7 @@ static int walk_tree_ex(ndx_file *file, ndx_scan_fn visit, void *ctx)
 {
     unsigned char page[ndx_page_size];
     ndx_walk_frame stack[ndx_walk_depth];
+    ndx_scan_entry entry;
     unsigned long count;
     unsigned long entry_offset;
     unsigned long child_page;
@@ -919,9 +920,10 @@ static int walk_tree_ex(ndx_file *file, ndx_scan_fn visit, void *ctx)
 
             entry_offset = 4UL + (stack[depth].index * file->key_record_size);
             stack[depth].index++;
-            if (visit(load_u32(page + entry_offset + 4UL),
-                page + entry_offset + 8UL,
-                file->key_length, ctx) != 0) {
+            entry.key = page + entry_offset + 8UL;
+            entry.key_length = file->key_length;
+            entry.ctx = ctx;
+            if (visit(load_u32(page + entry_offset + 4UL), &entry) != 0) {
                 return 1;
             }
             continue;
@@ -962,11 +964,9 @@ typedef struct walk_adapter_ctx {
 } walk_adapter_ctx;
 
 static int walk_adapter(unsigned long record_number,
-    const unsigned char *key, unsigned short key_length, void *vctx)
+    const ndx_scan_entry *entry)
 {
-    (void)key;
-    (void)key_length;
-    return ((walk_adapter_ctx *)vctx)->visit(record_number);
+    return ((walk_adapter_ctx *)entry->ctx)->visit(record_number);
 }
 
 /*

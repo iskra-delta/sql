@@ -34,23 +34,24 @@ It:
 - reads registered indexes from `<root>/sys/ndx.dbf`
 - inspects the current table schema through DBF field descriptors
 - matches only single-field indexes
-- only considers filters whose `WHERE` tree is one simple comparison
+- searches top-level conjunctive `WHERE` terms for simple literal
+  comparisons
 - checks whether the comparison value matches the field type
-- rewrites `table_scan` leaves under `filter` nodes to indexed probe
-  nodes when the rewrite is safe
+- annotates `table_scan` leaves with indexed equality or range access
+  when the choice is safe
+- prunes top-level predicates already enforced by that access and
+  compacts the remaining `WHERE` tree
 
 Current rewrites:
 
-- equality predicates become `index_scan_eq`
-- `<`, `<=`, `>`, `>=` predicates become `index_scan_range`
+- equality predicates become `table_scan` with equality access
+- `<`, `<=`, `>`, `>=` predicates become `table_scan` with range access
 
-The optimizer deliberately keeps the `filter` node in place.
 It does not currently rewrite join plans.
 
 ## What It Does Not Do Yet
 
 - composite-index selection
-- redundant filter removal
 - multi-predicate planning
 - `IN (...)` planning
 - selectivity or cost estimation
@@ -68,6 +69,5 @@ It does not currently rewrite join plans.
 - The optimizer already reads the same on-disk catalogs the SQL shell
   uses for runtime maintenance, so planning decisions and DDL metadata
   stay aligned.
-- The executor still performs full table scans today, so these rewrites
-  currently improve the architecture and plan shape more than runtime
-  speed.
+- The executor now consumes those access annotations directly, so these
+  rewrites improve runtime as well as plan shape.

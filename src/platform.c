@@ -18,13 +18,14 @@ void platform_exit(void) {}
  * BDOS call 8: console input without echo.
  * Returns the character in HL (char value in L).
  */
-int read_char(void)
+int read_char(void) __naked
 {
     __asm
         ld   c, #8
         call 5
         ld   l, a
         ld   h, #0
+        ret
     __endasm;
 }
 

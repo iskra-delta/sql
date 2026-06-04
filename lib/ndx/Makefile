@@ -2,6 +2,7 @@ cc ?= gcc
 ar ?= ar
 ranlib ?= ranlib
 sdcc ?= sdcc
+sdccflags ?= --std-c11 -mz80
 include_dir ?= ../../include
 build_dir ?= ../../build
 
@@ -38,9 +39,9 @@ $(build_dir):
 	mkdir -p $(build_dir)
 
 sdcc_check: $(sources) $(headers) | $(build_dir)
-	$(sdcc) --std-c11 -I$(include_dir) -c ndx.c \
+	$(sdcc) $(sdccflags) -I$(include_dir) -c ndx.c \
 		-o $(build_dir)/libndx_ndx.rel
-	$(sdcc) --std-c11 -I$(include_dir) -c binary64.c \
+	$(sdcc) $(sdccflags) -I$(include_dir) -c binary64.c \
 		-o $(build_dir)/libndx_binary64.rel
 
 clean:

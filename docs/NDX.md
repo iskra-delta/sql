@@ -173,13 +173,15 @@ the affected table.
 
 **`DROP TABLE`** — removes `.ndx` files and catalog rows.
 
-**Optimizer** — reads `sys/ndx.dbf` and rewrites `filter → table_scan`
-to `index_scan_eq` or `index_scan_range` for single-field conditions.
+**Optimizer** — reads `sys/ndx.dbf` and annotates `table_scan` with
+index equality or range access for single-field top-level conjuncts.
+When that access fully enforces a top-level predicate, the optimizer
+prunes it from the residual `WHERE` tree.
 
-**Executor** — acts on index-scan opcodes via `ndx_scan` callbacks:
-- `index_scan_eq`: equality callback stops when key passes the target
-- `index_scan_range`: range callback skips below lower bound, stops
-  past upper bound
+**Executor** — drives `ndx_scan` from the `table_scan` access mode:
+- equality access stops when key passes the target
+- range access skips below the lower bound and stops past the upper
+  bound
 
 ---
 
